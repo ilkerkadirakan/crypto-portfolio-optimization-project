@@ -1,0 +1,35 @@
+.venv
+__pycache__/
+
+# Ignore .mat files in the .raw directory
+data/raw/*.mat
+
+#Ignore parquet files
+data/processed/*.parquet
+
+# Ignore combination files
+data/meta/*.pkl
+
+
+#Ignore config files
+
+
+
+# Ignore .log files in the logs directory
+logs/*.log
+
+# Ignore temporary files
+*.tmp
+*.bak
+
+# Ignore system files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+.env
+*.swp
+
+
+#Ignore Agent files
+AGENTS.md

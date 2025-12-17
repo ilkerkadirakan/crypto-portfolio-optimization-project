@@ -1,0 +1,81 @@
+universe:
+  - symbol: AAVEBTC
+    base: AAVE
+    quote: BTC
+    full_name: Aave
+  - symbol: ADABTC
+    base: ADA
+    quote: BTC
+    full_name: Cardano
+  - symbol: AVAXBTC
+    base: AVAX
+    quote: BTC
+    full_name: Avalanche
+  - symbol: BCHBTC
+    base: BCH
+    quote: BTC
+    full_name: Bitcoin Cash
+  - symbol: BNBBTC
+    base: BNB
+    quote: BTC
+    full_name: BNB Chain
+  - symbol: DOGEBTC
+    base: DOGE
+    quote: BTC
+    full_name: Dogecoin
+  - symbol: DOTBTC
+    base: DOT
+    quote: BTC
+    full_name: Polkadot
+  - symbol: ETCBTC
+    base: ETC
+    quote: BTC
+    full_name: Ethereum Classic
+  - symbol: ETHBTC
+    base: ETH
+    quote: BTC
+    full_name: Ethereum
+  - symbol: FILBTC
+    base: FIL
+    quote: BTC
+    full_name: Filecoin
+  - symbol: ICPBTC
+    base: ICP
+    quote: BTC
+    full_name: Internet Computer
+  - symbol: LINKBTC
+    base: LINK
+    quote: BTC
+    full_name: Chainlink
+  - symbol: LTCBTC
+    base: LTC
+    quote: BTC
+    full_name: Litecoin
+  - symbol: NEARBTC
+    base: NEAR
+    quote: BTC
+    full_name: NEAR Protocol
+  - symbol: SOLBTC
+    base: SOL
+    quote: BTC
+    full_name: Solana
+  - symbol: STXBTC
+    base: STX
+    quote: BTC
+    full_name: Stacks
+  - symbol: TRXBTC
+    base: TRX
+    quote: BTC
+    full_name: TRON
+  - symbol: UNIBTC
+    base: UNI
+    quote: BTC
+    full_name: Uniswap
+  - symbol: XLMBTC
+    base: XLM
+    quote: BTC
+    full_name: Stellar Lumens
+  - symbol: XRPBTC
+    base: XRP
+    quote: BTC
+    full_name: Ripple
