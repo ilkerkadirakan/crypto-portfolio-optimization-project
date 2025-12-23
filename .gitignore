@@ -1,8 +1,6 @@
 .venv
 __pycache__/
 
-# Ignore .mat files in the .raw directory
-data/raw/*.mat
 
 #Ignore parquet files
 data/processed/*.parquet
@@ -10,6 +8,14 @@ data/processed/*.parquet
 # Ignore combination files
 data/meta/*.pkl
 
+#Ignore results files
+results/*.csv
+results/*.xlsx
+results/*.json
+results/*.parquet
+
+#Ignore Pipeline folder
+pipelines/
 
 #Ignore config files
 
