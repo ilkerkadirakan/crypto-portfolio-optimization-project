@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 
 from .metrics import summarize_portfolios
+import json
 
 plt.switch_backend("Agg")
 
@@ -188,9 +189,229 @@ def _plot_drawdown(drawdowns: Dict[str, pd.Series], figs_dir: Path) -> None:
     plt.close(fig)
 
 
+def _plot_teacher_vs_student(figs_dir: Path) -> None:
+    """
+    Plot Teacher vs Student comparison for all frequencies.
+
+    Reads winner JSON files and creates comparison bar charts.
+    """
+    project_root = Path(__file__).resolve().parents[1]
+    pipeline_dir = project_root / "results" / "pipeline"
+
+    if not pipeline_dir.exists():
+        return
+
+    # Load comparison files
+    comparisons = {}
+    for freq in ["1d", "1h"]:
+        comp_file = pipeline_dir / f"teacher_vs_student_{freq}.json"
+        if comp_file.exists():
+            with open(comp_file, 'r') as f:
+                comparisons[freq.upper()] = json.load(f)
+
+    if not comparisons:
+        return
+
+    # Create subplot for each frequency
+    n_freqs = len(comparisons)
+    fig, axes = plt.subplots(1, n_freqs, figsize=(6 * n_freqs, 5))
+    if n_freqs == 1:
+        axes = [axes]
+
+    for idx, (freq, data) in enumerate(comparisons.items()):
+        ax = axes[idx]
+
+        teacher = data.get('teacher', {})
+        student = data.get('student', {})
+
+        metrics = ['sharpe', 'annualized_return', 'volatility']
+        labels = ['Sharpe', 'Annual Return', 'Volatility']
+
+        teacher_vals = [teacher.get(m, 0) for m in metrics]
+        student_vals = [student.get(m, 0) for m in metrics]
+
+        x = np.arange(len(labels))
+        width = 0.35
+
+        bars1 = ax.bar(x - width/2, teacher_vals, width, label='Teacher', color='#1f77b4', alpha=0.8)
+        bars2 = ax.bar(x + width/2, student_vals, width, label='Student', color='#ff7f0e', alpha=0.8)
+
+        ax.set_ylabel('Value')
+        ax.set_title(f'Teacher vs Student ({freq})')
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, rotation=15, ha='right')
+        ax.legend()
+        ax.grid(True, axis='y', linestyle='--', alpha=0.3)
+
+        # Add value labels on bars
+        for bars in [bars1, bars2]:
+            for bar in bars:
+                height = bar.get_height()
+                ax.annotate(f'{height:.3f}',
+                          xy=(bar.get_x() + bar.get_width() / 2, height),
+                          xytext=(0, 3),
+                          textcoords="offset points",
+                          ha='center', va='bottom', fontsize=8)
+
+    fig.tight_layout()
+    fig_path = figs_dir / "teacher_vs_student_comparison.png"
+    fig.savefig(fig_path, dpi=200)
+    plt.close(fig)
+    print(f"[Reporting] Saved Teacher vs Student comparison to {fig_path}")
+
+
+def _plot_ranking_comparison(figs_dir: Path) -> None:
+    """
+    Plot top 10 portfolios for Teacher and Student side by side.
+    """
+    project_root = Path(__file__).resolve().parents[1]
+    pipeline_dir = project_root / "results" / "pipeline"
+
+    if not pipeline_dir.exists():
+        return
+
+    # Choose one frequency (1D) for detailed comparison
+    teacher_ranking_file = pipeline_dir / "teacher_ranking_1d.csv"
+    student_ranking_file = pipeline_dir / "student_ranking_1d.csv"
+
+    if not teacher_ranking_file.exists() or not student_ranking_file.exists():
+        return
+
+    teacher_df = pd.read_csv(teacher_ranking_file).head(10)
+    student_df = pd.read_csv(student_ranking_file).head(10)
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8))
+
+    # Teacher Top 10
+    teacher_combos = [c[:25] + '...' if len(c) > 25 else c for c in teacher_df['combo'].values]
+    teacher_sharpe = teacher_df['sharpe'].values
+
+    ax1.barh(range(len(teacher_sharpe)), teacher_sharpe, color='#1f77b4', alpha=0.7)
+    ax1.set_yticks(range(len(teacher_combos)))
+    ax1.set_yticklabels(teacher_combos, fontsize=9)
+    ax1.set_xlabel('Sharpe Ratio')
+    ax1.set_title('TOP 10 Teacher Portfolios (1D)', fontweight='bold')
+    ax1.invert_yaxis()
+    ax1.grid(True, axis='x', linestyle='--', alpha=0.3)
+
+    # Add value labels
+    for i, v in enumerate(teacher_sharpe):
+        ax1.text(v, i, f' {v:.4f}', va='center', fontsize=8)
+
+    # Student Top 10
+    student_combos = [c[:25] + '...' if len(c) > 25 else c for c in student_df['combo'].values]
+    student_sharpe = student_df['sharpe'].values
+
+    ax2.barh(range(len(student_sharpe)), student_sharpe, color='#ff7f0e', alpha=0.7)
+    ax2.set_yticks(range(len(student_combos)))
+    ax2.set_yticklabels(student_combos, fontsize=9)
+    ax2.set_xlabel('Sharpe Ratio')
+    ax2.set_title('TOP 10 Student Portfolios (1D)', fontweight='bold')
+    ax2.invert_yaxis()
+    ax2.grid(True, axis='x', linestyle='--', alpha=0.3)
+
+    # Add value labels
+    for i, v in enumerate(student_sharpe):
+        ax2.text(v, i, f' {v:.4f}', va='center', fontsize=8)
+
+    fig.tight_layout()
+    fig_path = figs_dir / "top10_teacher_vs_student.png"
+    fig.savefig(fig_path, dpi=200)
+    plt.close(fig)
+    print(f"[Reporting] Saved Top 10 ranking comparison to {fig_path}")
+
+
+def _plot_winner_highlights(figs_dir: Path) -> None:
+    """
+    Create a summary visualization highlighting the final winners.
+    """
+    project_root = Path(__file__).resolve().parents[1]
+    pipeline_dir = project_root / "results" / "pipeline"
+
+    if not pipeline_dir.exists():
+        return
+
+    # Load all winners
+    winners = {}
+    for freq in ["1d", "1h"]:
+        for version in ["teacher", "student"]:
+            winner_file = pipeline_dir / f"winner_{version}_{freq}.json"
+            if winner_file.exists():
+                with open(winner_file, 'r') as f:
+                    winners[f"{version}_{freq}"] = json.load(f)
+
+    if not winners:
+        return
+
+    # Create summary figure
+    fig = plt.figure(figsize=(14, 8))
+    gs = fig.add_gridspec(2, 2, hspace=0.3, wspace=0.3)
+
+    # Title
+    fig.suptitle('🏆 DUAL-WINNER PORTFOLIO OPTIMIZATION RESULTS',
+                 fontsize=16, fontweight='bold', y=0.98)
+
+    colors = {'teacher': '#1f77b4', 'student': '#ff7f0e'}
+
+    for idx, freq in enumerate(['1d', '1h']):
+        freq_upper = freq.upper()
+
+        # Create subplot
+        ax = fig.add_subplot(gs[idx, :])
+        ax.axis('off')
+
+        # Header
+        ax.text(0.5, 0.95, f'Frequency: {freq_upper}',
+               ha='center', fontsize=14, fontweight='bold',
+               transform=ax.transAxes)
+
+        y_pos = 0.80
+        for version in ['teacher', 'student']:
+            key = f"{version}_{freq}"
+            if key not in winners:
+                continue
+
+            data = winners[key]
+
+            # Version title
+            ax.text(0.5, y_pos, f'👑 {version.upper()} WINNER',
+                   ha='center', fontsize=12, fontweight='bold',
+                   color=colors[version], transform=ax.transAxes)
+
+            y_pos -= 0.10
+
+            # Details
+            details = [
+                f"Combo: {data.get('combo', 'N/A')}",
+                f"Model: {data.get('model', 'N/A')}",
+                f"Sharpe: {data.get('sharpe', 0):.4f}",
+                f"Annual Return: {data.get('annualized_return', 0):.2%}",
+                f"Volatility: {data.get('volatility', 0):.2%}"
+            ]
+
+            for detail in details:
+                ax.text(0.5, y_pos, detail, ha='center', fontsize=10,
+                       family='monospace', transform=ax.transAxes)
+                y_pos -= 0.06
+
+            y_pos -= 0.05
+
+        # Add separator
+        if idx == 0:
+            ax.axhline(y=0.05, color='gray', linestyle='--',
+                      linewidth=1, transform=ax.transAxes)
+
+    fig_path = figs_dir / "winner_summary.png"
+    fig.savefig(fig_path, dpi=200, bbox_inches='tight')
+    plt.close(fig)
+    print(f"[Reporting] Saved winner summary to {fig_path}")
+
+
 def generate_all_reports(df_runs: pd.DataFrame) -> None:
     """
     Create summary tables and figures from backtest run outputs.
+
+    Includes both traditional metrics and Dual-Winner visualizations.
     """
     tables_dir, figs_dir = _output_dirs()
 
@@ -241,11 +462,32 @@ def generate_all_reports(df_runs: pd.DataFrame) -> None:
             )
 
     frontier_df = pd.DataFrame(frontier_records)
+
+    # Traditional plots
     _plot_frontier(frontier_df, figs_dir)
     _plot_rolling_sharpe(rolling_sharpes, figs_dir)
     _plot_drawdown(drawdown_series_map, figs_dir)
+
+    # Dual-Winner visualizations
+    print("\n[Reporting] Generating Dual-Winner visualizations...")
+    _plot_teacher_vs_student(figs_dir)
+    _plot_ranking_comparison(figs_dir)
+    _plot_winner_highlights(figs_dir)
+    print("[Reporting] All reports generated successfully!")
 
 
 __all__ = [
     "generate_all_reports",
 ]
+
+
+if __name__ == "__main__":
+    # Test dual-winner visualizations
+    project_root = Path(__file__).resolve().parents[1]
+    figs_dir = project_root / "results" / "figs"
+    figs_dir.mkdir(parents=True, exist_ok=True)
+
+    _plot_teacher_vs_student(figs_dir)
+    _plot_ranking_comparison(figs_dir)
+    _plot_winner_highlights(figs_dir)
+    print("Test visualizations generated!")

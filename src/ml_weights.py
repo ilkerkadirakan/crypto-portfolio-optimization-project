@@ -17,9 +17,15 @@ import numpy as np
 import pandas as pd
 from lightgbm import LGBMRegressor
 from sklearn.model_selection import TimeSeriesSplit
+from sklearn.ensemble import RandomForestRegressor
+try:
+    import xgboost as xgb
+    XGB_AVAILABLE = True
+except ImportError:
+    XGB_AVAILABLE = False
 
 # Constants
-LAG_WINDOWS = 10  # Number of past windows to use as features
+LAG_WINDOWS = 10  # Back to 10 for ensemble approach
 TOP_K_ASSETS = {2, 3, 5}  # Valid portfolio sizes
 MAX_WEIGHT = 0.30  # Maximum weight per asset
 
@@ -110,33 +116,55 @@ def _create_lagged_features(
         row_features = {'timestamp': ts}
 
         for asset in asset_list:
-            # Get lagged moments
+            # Core lagged features
             for lag in range(1, n_lags + 1):
                 lag_idx = ts_idx - lag
 
-                # Mean
+                # Basic features
                 if 'mean' in moment_panels and asset in moment_panels['mean'].columns:
                     row_features[f'{asset}_mean_lag{lag}'] = moment_panels['mean'].iloc[lag_idx][asset]
 
-                # Variance
                 if 'variance' in moment_panels and asset in moment_panels['variance'].columns:
-                    row_features[f'{asset}_var_lag{lag}'] = moment_panels['variance'].iloc[lag_idx][asset]
+                    variance_val = moment_panels['variance'].iloc[lag_idx][asset]
+                    row_features[f'{asset}_var_lag{lag}'] = variance_val
 
-                # Skewness
+                    # Volatility (sqrt of variance)
+                    if variance_val > 0:
+                        row_features[f'{asset}_vol_lag{lag}'] = np.sqrt(variance_val)
+
                 if 'skewness' in moment_panels and asset in moment_panels['skewness'].columns:
                     row_features[f'{asset}_skew_lag{lag}'] = moment_panels['skewness'].iloc[lag_idx][asset]
 
-                # Kurtosis
                 if 'kurtosis' in moment_panels and asset in moment_panels['kurtosis'].columns:
                     row_features[f'{asset}_kurt_lag{lag}'] = moment_panels['kurtosis'].iloc[lag_idx][asset]
 
-                # CVaR
                 if 'cvar' in moment_panels and asset in moment_panels['cvar'].columns:
                     row_features[f'{asset}_cvar_lag{lag}'] = moment_panels['cvar'].iloc[lag_idx][asset]
 
                 # Raw returns
                 if asset in returns_df.columns:
                     row_features[f'{asset}_return_lag{lag}'] = returns_df.iloc[lag_idx][asset]
+
+            # Enhanced features for better performance
+            if asset in returns_df.columns and ts_idx >= 5:
+                recent_returns = [returns_df.iloc[ts_idx - i][asset] for i in range(1, 6)]
+
+                # Momentum indicators
+                row_features[f'{asset}_momentum_3'] = recent_returns[0] - recent_returns[2]
+                row_features[f'{asset}_momentum_5'] = recent_returns[0] - recent_returns[4]
+
+                # Moving averages
+                row_features[f'{asset}_ma3'] = np.mean(recent_returns[:3])
+                row_features[f'{asset}_ma5'] = np.mean(recent_returns[:5])
+
+                # Volatility measures
+                row_features[f'{asset}_vol_5'] = np.std(recent_returns)
+
+                # Risk-adjusted return
+                mean_ret = np.mean(recent_returns)
+                vol_ret = np.std(recent_returns)
+                if vol_ret > 1e-8:
+                    row_features[f'{asset}_sharpe_5'] = mean_ret / vol_ret
 
         features_list.append(row_features)
 
@@ -186,7 +214,9 @@ def _apply_portfolio_constraints(
 def train_weight_models(
     teacher_results: pd.DataFrame,
     processed_dir: Path,
-    freq: str
+    freq: str,
+    use_ensemble: bool = False,  # New parameter for ensemble control
+    model_types: list = None     # Which models to use
 ) -> None:
     """
     Train ML models to learn portfolio weights from teacher.
@@ -201,6 +231,12 @@ def train_weight_models(
         Directory containing processed data
     freq : str
         Frequency identifier (1H or 1D)
+    use_ensemble : bool, default False
+        If True, use ensemble of multiple models for better accuracy
+        If False, use single fast LightGBM model for speed
+    model_types : list, optional
+        List of model types to use: ['lgb', 'xgb', 'rf']
+        Default: ['lgb'] for single model, ['lgb', 'xgb', 'rf'] for ensemble
     """
     print(f"\n[ML-Weights] Training student models for freq={freq}")
 
@@ -214,6 +250,24 @@ def train_weight_models(
     asset_list = [col.replace('weight_', '') for col in weight_cols]
 
     print(f"[ML-Weights] Found {len(asset_list)} assets")
+
+    # Select best teacher portfolio (highest mean return per timestamp)
+    print(f"[ML-Weights] Selecting best teacher portfolio based on Sharpe ratio...")
+    teacher_perf = teacher_results.groupby(['combo', 'model'])['net_return'].agg(['mean', 'std'])
+    # Calculate annualized Sharpe ratio: (mean / std) * sqrt(252)
+    daily_sharpe = teacher_perf['mean'] / (teacher_perf['std'] + 1e-10)
+    teacher_perf['sharpe'] = daily_sharpe * np.sqrt(252)  # Annualized Sharpe
+    best_idx = teacher_perf['sharpe'].idxmax()
+    best_combo, best_model = best_idx
+
+    print(f"[ML-Weights] Best teacher: combo={best_combo}, model={best_model}, Sharpe={teacher_perf.loc[best_idx, 'sharpe']:.4f}")
+
+    # Filter teacher weights to only best portfolio
+    teacher_weights_best = teacher_weights[
+        (teacher_weights['combo'] == best_combo) &
+        (teacher_weights['model'] == best_model)
+    ].copy()
+
     print(f"[ML-Weights] Creating lagged features with {LAG_WINDOWS} lags...")
 
     # Create lagged features
@@ -221,8 +275,8 @@ def train_weight_models(
 
     print(f"[ML-Weights] Features shape: {features_df.shape}")
 
-    # Merge features with teacher weights
-    merged_df = features_df.join(teacher_weights.set_index('timestamp')[weight_cols], how='inner')
+    # Merge features with teacher weights (now only one combo/model per timestamp)
+    merged_df = features_df.join(teacher_weights_best.set_index('timestamp')[weight_cols], how='inner')
 
     if merged_df.empty:
         warnings.warn("[ML-Weights] No overlapping timestamps between features and teacher weights")
@@ -234,33 +288,130 @@ def train_weight_models(
     X = merged_df.drop(columns=weight_cols).fillna(0)
     y = merged_df[weight_cols].fillna(0)
 
-    print(f"[ML-Weights] Training {len(asset_list)} asset models...")
+    # Set default model types
+    if model_types is None:
+        if use_ensemble:
+            model_types = ['lgb', 'xgb', 'rf']
+        else:
+            model_types = ['lgb']
 
-    # Train one model per asset
+    # Validate available models
+    available_models = ['lgb']
+    if XGB_AVAILABLE:
+        available_models.append('xgb')
+    available_models.append('rf')
+
+    model_types = [m for m in model_types if m in available_models]
+
+    print(f"[ML-Weights] Training {len(asset_list)} asset models")
+    if use_ensemble:
+        print(f"[ML-Weights] Using ensemble approach with models: {model_types}")
+    else:
+        print(f"[ML-Weights] Using single model: {model_types[0]}")
+
+    # Train models for each asset
     models = {}
+
     for asset_col in weight_cols:
         asset_name = asset_col.replace('weight_', '')
 
-        # Train with time series cross-validation
-        model = LGBMRegressor(
-            objective='regression',
-            learning_rate=0.05,
-            num_leaves=31,
-            n_estimators=400,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            random_state=42,
-            verbose=-1
-        )
+        if use_ensemble:
+            # Ensemble approach - multiple models per asset
+            asset_models = {}
 
-        try:
-            model.fit(X.values, y[asset_col].values)
-            models[asset_name] = model
-            print(f"[ML-Weights]   ✓ Trained model for {asset_name}")
-        except Exception as exc:
-            warnings.warn(f"[ML-Weights] Failed to train model for {asset_name}: {exc}")
+            for model_type in model_types:
+                if model_type == 'lgb':
+                    model = LGBMRegressor(
+                        objective='regression',
+                        learning_rate=0.05,
+                        num_leaves=31,
+                        n_estimators=300,
+                        subsample=0.8,
+                        colsample_bytree=0.8,
+                        random_state=42,
+                        verbose=-1
+                    )
+                elif model_type == 'xgb' and XGB_AVAILABLE:
+                    model = xgb.XGBRegressor(
+                        objective='reg:squarederror',
+                        learning_rate=0.05,
+                        max_depth=6,
+                        n_estimators=300,
+                        subsample=0.8,
+                        colsample_bytree=0.8,
+                        random_state=42,
+                        verbosity=0
+                    )
+                elif model_type == 'rf':
+                    model = RandomForestRegressor(
+                        n_estimators=200,
+                        max_depth=10,
+                        min_samples_split=5,
+                        min_samples_leaf=2,
+                        max_features='sqrt',
+                        random_state=42,
+                        n_jobs=-1
+                    )
 
-    print(f"[ML-Weights] Successfully trained {len(models)} models")
+                try:
+                    model.fit(X.values, y[asset_col].values)
+                    asset_models[model_type] = model
+                except Exception as exc:
+                    warnings.warn(f"[ML-Weights] Failed to train {model_type} for {asset_name}: {exc}")
+
+            if asset_models:
+                models[asset_name] = asset_models
+                model_names = list(asset_models.keys())
+                print(f"[ML-Weights]   ✓ Trained ensemble for {asset_name} ({', '.join(model_names)})")
+
+        else:
+            # Single model approach (fast)
+            model_type = model_types[0]
+            if model_type == 'lgb':
+                model = LGBMRegressor(
+                    objective='regression',
+                    learning_rate=0.1,
+                    num_leaves=15,
+                    n_estimators=100,
+                    subsample=0.9,
+                    colsample_bytree=0.9,
+                    random_state=42,
+                    verbose=-1,
+                    n_jobs=1
+                )
+            elif model_type == 'xgb' and XGB_AVAILABLE:
+                model = xgb.XGBRegressor(
+                    objective='reg:squarederror',
+                    learning_rate=0.1,
+                    max_depth=4,
+                    n_estimators=100,
+                    subsample=0.9,
+                    colsample_bytree=0.9,
+                    random_state=42,
+                    verbosity=0
+                )
+            elif model_type == 'rf':
+                model = RandomForestRegressor(
+                    n_estimators=100,
+                    max_depth=8,
+                    min_samples_split=5,
+                    min_samples_leaf=2,
+                    max_features='sqrt',
+                    random_state=42,
+                    n_jobs=-1
+                )
+
+            try:
+                model.fit(X.values, y[asset_col].values)
+                models[asset_name] = model
+                print(f"[ML-Weights]   ✓ Trained {model_type} model for {asset_name}")
+            except Exception as exc:
+                warnings.warn(f"[ML-Weights] Failed to train model for {asset_name}: {exc}")
+
+    if use_ensemble:
+        print(f"[ML-Weights] Successfully trained ensemble models for {len(models)} assets")
+    else:
+        print(f"[ML-Weights] Successfully trained {len(models)} single models")
 
     # Save models
     import joblib
@@ -277,14 +428,45 @@ def train_weight_models(
 
     print(f"[ML-Weights] Saved models to {models_path}")
 
-    # Generate predictions for all data
-    print(f"[ML-Weights] Generating weight predictions...")
+    # Generate predictions
+    if use_ensemble:
+        print(f"[ML-Weights] Generating ensemble weight predictions...")
+    else:
+        print(f"[ML-Weights] Generating weight predictions...")
 
     predictions = {}
-    for asset_name, model in models.items():
+    for asset_name, model_data in models.items():
         try:
-            pred = model.predict(X.values)
-            predictions[f'pred_weight_{asset_name}'] = pred
+            if use_ensemble and isinstance(model_data, dict):
+                # Ensemble prediction - average multiple models
+                ensemble_preds = []
+                weights = []
+
+                for model_type, model in model_data.items():
+                    pred = model.predict(X.values)
+                    ensemble_preds.append(pred)
+
+                    # Weight different models
+                    if model_type == 'xgb':
+                        weights.append(0.4)  # Higher weight for XGBoost
+                    elif model_type == 'lgb':
+                        weights.append(0.4 if 'xgb' not in model_data else 0.35)
+                    else:  # RandomForest
+                        weights.append(0.25)
+
+                # Normalize weights
+                weights = np.array(weights)
+                weights = weights / weights.sum()
+
+                # Weighted ensemble prediction
+                ensemble_pred = np.average(ensemble_preds, axis=0, weights=weights)
+                predictions[f'pred_weight_{asset_name}'] = ensemble_pred
+
+            else:
+                # Single model prediction
+                pred = model_data.predict(X.values)
+                predictions[f'pred_weight_{asset_name}'] = pred
+
         except Exception as exc:
             warnings.warn(f"[ML-Weights] Failed to predict for {asset_name}: {exc}")
 

@@ -5,6 +5,7 @@ pyyaml
 cvxpy
 scikit-learn
 lightgbm
+xgboost
 joblib
 matplotlib
 seaborn

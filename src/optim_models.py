@@ -208,6 +208,39 @@ def solve_portfolio(
     if sigma_mat.shape[0] != mu_vec.size:
         raise ValueError("Covariance matrix dimension must match the length of mu.")
 
+    # Enhanced input validation
+    if not np.isfinite(mu_vec).all():
+        raise ValueError("Mean returns vector contains NaN or Inf values.")
+    if not np.isfinite(sigma_mat).all():
+        raise ValueError("Covariance matrix contains NaN or Inf values.")
+
+    # Check for numerical issues in covariance matrix
+    try:
+        eigenvalues = np.linalg.eigvalsh(sigma_mat)
+        min_eigenvalue = np.min(eigenvalues)
+        if min_eigenvalue <= 0:
+            # Add small regularization to ensure positive definiteness
+            regularization = abs(min_eigenvalue) + 1e-8
+            sigma_mat = sigma_mat + regularization * np.eye(sigma_mat.shape[0])
+    except np.linalg.LinAlgError:
+        raise ValueError("Covariance matrix is severely ill-conditioned.")
+
+    # Validate moment inputs for higher-order models
+    if model_key in {"MVSK", "MCVARSK"}:
+        if skew is not None:
+            skew_arr = np.asarray(skew, dtype=float).reshape(-1)
+            if not np.isfinite(skew_arr).all():
+                raise ValueError("Skewness vector contains NaN or Inf values.")
+        if kurt is not None:
+            kurt_arr = np.asarray(kurt, dtype=float).reshape(-1)
+            if not np.isfinite(kurt_arr).all():
+                raise ValueError("Kurtosis vector contains NaN or Inf values.")
+
+    if model_key == "MCVARSK" and cvar_series is not None:
+        cvar_arr = np.asarray(cvar_series, dtype=float).reshape(-1)
+        if not np.isfinite(cvar_arr).all():
+            raise ValueError("CVaR vector contains NaN or Inf values.")
+
     n_assets = mu_vec.size
     config = params or _load_params()
     portfolio_cfg = config.get("portfolio", {})
@@ -272,10 +305,29 @@ def solve_portfolio(
             - lambda_skew * skew_term
             + lambda_kurt * kurt_term
         )
-    problem = cp.Problem(cp.Minimize(objective_expr), constraints)
+    # Validate problem formulation before solving
+    try:
+        problem = cp.Problem(cp.Minimize(objective_expr), constraints)
+    except Exception as exc:
+        raise ValueError(f"Error constructing optimization problem: {exc}")
+
+    # Check if problem is DCP (Disciplined Convex Programming)
+    if not problem.is_dcp():
+        raise ValueError(
+            f"Problem is not DCP (Disciplined Convex Programming). "
+            f"This usually indicates an issue with the objective formulation."
+        )
 
     last_error: Optional[Exception] = None
     status: Optional[str] = None
+
+    # Filter solver options to only include CVXPY-compatible parameters
+    # Remove solver-specific parameters that might cause parsing errors
+    cvxpy_options = {}
+    if "max_iters" in solver_options:
+        cvxpy_options["max_iters"] = solver_options["max_iters"]
+    if "verbose" in solver_options:
+        cvxpy_options["verbose"] = solver_options["verbose"]
 
     for solver_name in _solver_sequence(solver_cfg):
         try:
@@ -285,9 +337,26 @@ def solve_portfolio(
             continue
 
         try:
-            problem.solve(solver=selected_solver, **solver_options)
+            # Try with filtered options first, then without options if it fails
+            try:
+                problem.solve(solver=selected_solver, **cvxpy_options)
+            except Exception as solve_exc:
+                # If options cause issues, try without them
+                if cvxpy_options:
+                    problem.solve(solver=selected_solver)
+                else:
+                    raise solve_exc
+
             status = problem.status
+        except cp.DCPError as exc:
+            # DCP violation error - this is a formulation problem
+            raise ValueError(f"DCP violation in problem formulation: {exc}")
         except cp.SolverError as exc:
+            last_error = exc
+            status = None
+            continue
+        except Exception as exc:
+            # Catch any other errors (including parsing errors)
             last_error = exc
             status = None
             continue
@@ -296,9 +365,18 @@ def solve_portfolio(
             break
 
     if status not in {cp.OPTIMAL, cp.OPTIMAL_INACCURATE} or weights.value is None:
-        raise RuntimeError(f"Solver failed to find an optimal solution. Last error: {last_error}")
+        error_msg = f"Solver failed to find an optimal solution. Status: {status}"
+        if last_error:
+            error_msg += f" Last error: {last_error}"
+        raise RuntimeError(error_msg)
 
-    return np.asarray(weights.value, dtype=float).reshape(-1)
+    result = np.asarray(weights.value, dtype=float).reshape(-1)
+
+    # Final validation
+    if not np.isfinite(result).all():
+        raise RuntimeError("Solver returned non-finite weights.")
+
+    return result
 
 
 __all__ = [

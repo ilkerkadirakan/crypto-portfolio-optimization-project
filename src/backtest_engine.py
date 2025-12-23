@@ -350,6 +350,23 @@ def _load_moments(freq: str, processed_dir: Path, version: str) -> Tuple[Dict[st
     return baseline_panels, forecast_panels
 
 
+def _load_ml_weights(freq: str, processed_dir: Path) -> pd.DataFrame | None:
+    """
+    Load ML-predicted portfolio weights for the requested frequency.
+
+    Returns None if ML weights are not available.
+    """
+    suffix = _freq_suffix(freq)
+    ml_weights_path = processed_dir / f"ml_predicted_weights_{suffix}.parquet"
+
+    if not ml_weights_path.exists():
+        return None
+
+    ml_weights = pd.read_parquet(ml_weights_path)
+    ml_weights = _ensure_datetime_index(ml_weights)
+    return ml_weights
+
+
 def _apply_asset_subset(df: pd.DataFrame, assets: Optional[List[str]]) -> pd.DataFrame:
     """
     Restrict a DataFrame to a subset of assets if specified.
@@ -416,10 +433,27 @@ def run_backtest(
     baseline_panels, forecast_panels = _load_moments(freq_norm, processed_dir, version_norm)
     cfg_bt = _get_backtest_config(cfg, freq_norm)
 
+    # Load ML-predicted weights if version is ML
+    ml_weights_df = None
+    if version_norm in ML_VERSION:
+        ml_weights_df = _load_ml_weights(freq_norm, processed_dir)
+        if ml_weights_df is not None:
+            print(f"[Backtest] Using ML-predicted weights for version={version_norm}")
+        else:
+            print(f"[Backtest] ML weights not available, falling back to baseline optimization")
+
     asset_list_all = list(returns_df.columns)
     simple_returns = (np.exp(returns_df) - 1.0).fillna(0.0)
 
-    index_common = simple_returns.index
+    # Filter index to only include timestamps where moments are available
+    # Check first valid moment timestamp
+    first_valid_moment = baseline_panels.get("mean").dropna(how='all').index[0] if "mean" in baseline_panels and not baseline_panels["mean"].dropna(how='all').empty else None
+
+    if first_valid_moment is not None:
+        index_common = simple_returns.loc[first_valid_moment:].index
+    else:
+        index_common = simple_returns.index
+
     rebalance_positions = _rebalance_positions(index_common, cfg_bt)
     if not rebalance_positions:
         raise ValueError("No rebalance positions were generated; check window and data alignment.")
@@ -499,29 +533,81 @@ def run_backtest(
                     if covariance_matrix is None:
                         covariance_matrix = _diag_covariance(variance_series.loc[active_assets])
 
-                    try:
-                        weights_active = solve_portfolio(
-                            model_name=model_name,
-                            mu=mu_series.loc[active_assets].values,
-                            sigma=covariance_matrix,
-                            skew=skew_series.loc[active_assets].values,
-                            kurt=kurt_series.loc[active_assets].values,
-                            cvar_series=cvar_series.loc[active_assets].values,
-                            params=params,
-                        )
-                        weights_active = _sanitize_weights(weights_active)
-                        weights_full = np.zeros(len(asset_list), dtype=float)
-                        for asset, weight in zip(active_assets, weights_active):
-                            weights_full[asset_list.index(asset)] = weight
-                    except Exception as exc:
-                        warnings.warn(
-                            f"Optimization failed for model '{model_name}' at {ts}: {exc}. "
-                            "Reusing previous weights."
-                        )
-                        weights_full = prev_weights_full.copy()
+                    # Extract moment values for active assets
+                    mu_vals = mu_series.loc[active_assets].values
+                    skew_vals = skew_series.loc[active_assets].values
+                    kurt_vals = kurt_series.loc[active_assets].values
+                    cvar_vals = cvar_series.loc[active_assets].values
 
-                    turnover = float(np.sum(np.abs(weights_full - prev_weights_full)))
-                    transaction_cost = turnover * cfg_bt.transaction_cost
+                    # Validate inputs before calling solver
+                    input_valid = True
+                    if not (np.isfinite(mu_vals).all() and np.isfinite(skew_vals).all() and
+                            np.isfinite(kurt_vals).all() and np.isfinite(cvar_vals).all()):
+                        input_valid = False
+                    if not np.isfinite(covariance_matrix).all():
+                        input_valid = False
+                    if len(active_assets) < 2:
+                        input_valid = False
+
+                    if not input_valid:
+                        # Track and warn about invalid inputs
+                        failure_key = f"{combo_label}_{model_name}"
+                        if not hasattr(run_backtest, '_failures'):
+                            run_backtest._failures = {}
+                        if failure_key not in run_backtest._failures:
+                            run_backtest._failures[failure_key] = 0
+                        run_backtest._failures[failure_key] += 1
+
+                        if run_backtest._failures[failure_key] == 1:
+                            warnings.warn(
+                                f"Invalid inputs for model '{model_name}' combo '{combo_label}'. "
+                                f"This warning will not repeat for this combination. "
+                                f"Reason: NaN/Inf values or insufficient assets.",
+                                UserWarning,
+                                stacklevel=2
+                            )
+                        weights_full = prev_weights_full.copy()
+                        turnover = 0.0
+                        transaction_cost = 0.0
+                    else:
+                        try:
+                            weights_active = solve_portfolio(
+                                model_name=model_name,
+                                mu=mu_vals,
+                                sigma=covariance_matrix,
+                                skew=skew_vals,
+                                kurt=kurt_vals,
+                                cvar_series=cvar_vals,
+                                params=params,
+                            )
+                            weights_active = _sanitize_weights(weights_active)
+                            weights_full = np.zeros(len(asset_list), dtype=float)
+                            for asset, weight in zip(active_assets, weights_active):
+                                weights_full[asset_list.index(asset)] = weight
+                        except Exception as exc:
+                            # Track failures per combo to avoid spam
+                            failure_key = f"{combo_label}_{model_name}"
+                            if not hasattr(run_backtest, '_failures'):
+                                run_backtest._failures = {}
+
+                            if failure_key not in run_backtest._failures:
+                                run_backtest._failures[failure_key] = 0
+
+                            run_backtest._failures[failure_key] += 1
+
+                            # Only warn on first failure for each combo/model pair
+                            if run_backtest._failures[failure_key] == 1:
+                                warnings.warn(
+                                    f"Optimization failed for model '{model_name}' combo '{combo_label}'. "
+                                    f"This warning will not repeat for this combination. "
+                                    f"Error: {exc}",
+                                    UserWarning,
+                                    stacklevel=2
+                                )
+                            weights_full = prev_weights_full.copy()
+
+                        turnover = float(np.sum(np.abs(weights_full - prev_weights_full)))
+                        transaction_cost = turnover * cfg_bt.transaction_cost
 
                 for step_idx, period_ts in enumerate(period_index):
                     asset_returns = returns_subset.loc[period_ts, :].values
@@ -574,7 +660,304 @@ def run_backtest(
         return pd.DataFrame()
 
     combined = pd.concat(all_runs, ignore_index=True)
-    combined = combined.sort_values(["combo", "model", "timestamp"])
+    # Skip sorting - not needed for groupby and causes MemoryError on large datasets (46M+ rows)
+    # combined = combined.sort_values(["combo", "model", "timestamp"])
+    return combined
+
+
+def _process_single_combo_model(args: Tuple) -> Optional[pd.DataFrame]:
+    """
+    Process a single combination-model pair for parallel execution.
+
+    This function is designed to be called by multiprocessing.Pool, so all
+    arguments are packed into a single tuple.
+
+    Parameters
+    ----------
+    args : Tuple
+        Packed arguments containing all necessary data for processing one combo-model pair.
+
+    Returns
+    -------
+    pd.DataFrame or None
+        Backtest results for this combo-model pair, or None if processing failed.
+    """
+    (
+        combo, model_name, freq_norm, version_norm, returns_df, baseline_panels,
+        forecast_panels, ml_weights_df, index_common, rebalance_positions, cfg_bt,
+        cfg, asset_list_all, results_root, freq_suffix
+    ) = args
+
+    try:
+        combo_label = _combo_label(combo)
+        combo_assets = _combo_assets(combo) or asset_list_all
+        params_override = _combo_params(combo)
+        params = _merge_params(cfg, params_override) if params_override else cfg
+
+        simple_returns = (np.exp(returns_df) - 1.0).fillna(0.0)
+        returns_subset = _apply_asset_subset(simple_returns, combo_assets)
+        asset_list = list(returns_subset.columns)
+
+        if not asset_list:
+            warnings.warn(f"Combo '{combo_label}' resulted in empty asset universe; skipping.")
+            return None
+
+        baseline_selected = _select_panels(baseline_panels, asset_list)
+        forecast_selected = _select_panels(forecast_panels, asset_list) if forecast_panels else {}
+
+        records: List[Dict[str, object]] = []
+        prev_weights_full = np.zeros(len(asset_list), dtype=float)
+
+        for pos_idx, start_pos in enumerate(rebalance_positions):
+            ts = index_common[start_pos]
+            end_pos = rebalance_positions[pos_idx + 1] if pos_idx + 1 < len(rebalance_positions) else len(index_common)
+            period_index = index_common[start_pos:end_pos]
+
+            if version_norm in ML_VERSION and forecast_selected:
+                mu_series, variance_series, skew_series, kurt_series, cvar_series = _prepare_moment_inputs(
+                    ts, asset_list, forecast_selected, baseline_selected
+                )
+            else:
+                mu_series, variance_series, skew_series, kurt_series, cvar_series = _prepare_moment_inputs(
+                    ts, asset_list, baseline_selected, forecast_selected
+                )
+
+            active_mask = (
+                mu_series.notna()
+                & variance_series.notna()
+                & skew_series.notna()
+                & kurt_series.notna()
+                & cvar_series.notna()
+            )
+
+            active_assets = [asset for asset, flag in zip(asset_list, active_mask) if flag]
+            if not active_assets:
+                weights_full = prev_weights_full.copy()
+                turnover = 0.0
+                transaction_cost = 0.0
+            else:
+                window_slice = returns_subset.iloc[max(0, start_pos - cfg_bt.window + 1):start_pos + 1]
+                covariance_matrix = _ledoit_covariance(window_slice, active_assets)
+                if covariance_matrix is None:
+                    covariance_matrix = _diag_covariance(variance_series.loc[active_assets])
+
+                mu_vals = mu_series.loc[active_assets].values
+                skew_vals = skew_series.loc[active_assets].values
+                kurt_vals = kurt_series.loc[active_assets].values
+                cvar_vals = cvar_series.loc[active_assets].values
+
+                input_valid = True
+                if not (np.isfinite(mu_vals).all() and np.isfinite(skew_vals).all() and
+                        np.isfinite(kurt_vals).all() and np.isfinite(cvar_vals).all()):
+                    input_valid = False
+                if not np.isfinite(covariance_matrix).all():
+                    input_valid = False
+                if len(active_assets) < 2:
+                    input_valid = False
+
+                if not input_valid:
+                    weights_full = prev_weights_full.copy()
+                    turnover = 0.0
+                    transaction_cost = 0.0
+                else:
+                    try:
+                        weights_active = solve_portfolio(
+                            model_name=model_name,
+                            mu=mu_vals,
+                            sigma=covariance_matrix,
+                            skew=skew_vals,
+                            kurt=kurt_vals,
+                            cvar_series=cvar_vals,
+                            params=params,
+                        )
+                        weights_active = _sanitize_weights(weights_active)
+                        weights_full = np.zeros(len(asset_list), dtype=float)
+                        for asset, weight in zip(active_assets, weights_active):
+                            weights_full[asset_list.index(asset)] = weight
+                    except Exception:
+                        weights_full = prev_weights_full.copy()
+
+                    turnover = float(np.sum(np.abs(weights_full - prev_weights_full)))
+                    transaction_cost = turnover * cfg_bt.transaction_cost
+
+            for step_idx, period_ts in enumerate(period_index):
+                asset_returns = returns_subset.loc[period_ts, :].values
+                gross_return = float(np.dot(asset_returns, weights_full))
+                cost = transaction_cost if step_idx == 0 else 0.0
+                net_return = gross_return - cost
+                record = {
+                    "timestamp": period_ts,
+                    "freq": freq_norm,
+                    "version": version_norm,
+                    "model": model_name.upper(),
+                    "combo": combo_label,
+                    "gross_return": gross_return,
+                    "transaction_cost": cost,
+                    "net_return": net_return,
+                    "turnover": turnover if step_idx == 0 else 0.0,
+                    "rebalance": step_idx == 0,
+                }
+                for asset, weight in zip(asset_list, weights_full):
+                    record[f"weight_{asset}"] = float(weight)
+                records.append(record)
+
+            prev_weights_full = weights_full.copy()
+
+        run_df = pd.DataFrame.from_records(records)
+        if run_df.empty:
+            return None
+        run_df = run_df.sort_values("timestamp").set_index("timestamp")
+
+        result_dir = results_root / f"{freq_suffix}_{model_name.lower()}_{version_norm}"
+        result_dir.mkdir(parents=True, exist_ok=True)
+        combo_slug = _slugify(combo_label)
+        output_path = result_dir / f"{combo_slug}.parquet"
+        run_df.to_parquet(output_path)
+
+        if freq_norm == "1H":
+            daily_df = _resample_hourly_to_daily(run_df[["gross_return", "net_return"]])
+            if not daily_df.empty:
+                daily_df["model"] = model_name.upper()
+                daily_df["version"] = version_norm
+                daily_df["combo"] = combo_label
+                daily_dir = result_dir / "daily"
+                daily_dir.mkdir(parents=True, exist_ok=True)
+                daily_path = daily_dir / f"{combo_slug}.parquet"
+                daily_df.to_parquet(daily_path)
+
+        return run_df.reset_index()
+
+    except Exception as e:
+        warnings.warn(f"Failed to process combo {_combo_label(combo)} with model {model_name}: {e}")
+        return None
+
+
+def run_backtest_parallel(
+    freq: str,
+    version: str,
+    model_list: Sequence[str],
+    combo_iterable: Iterable[Union[str, int, Tuple, List, Dict[str, object]]],
+    n_jobs: int = -1,
+) -> pd.DataFrame:
+    """
+    Execute rolling portfolio backtests using parallel processing.
+
+    This is a parallelized version of run_backtest that processes multiple
+    combination-model pairs simultaneously using multiprocessing.
+
+    Parameters
+    ----------
+    freq : str
+        Frequency identifier ('1H' or '1D').
+    version : str
+        Data version flag ('baseline' or 'ml').
+    model_list : Sequence[str]
+        Collection of optimization model names (e.g., ['MV', 'MVSK']).
+    combo_iterable : Iterable
+        Iterable of scenario definitions.
+    n_jobs : int, optional
+        Number of parallel workers. -1 uses all available CPUs (default).
+
+    Returns
+    -------
+    pd.DataFrame
+        Concatenated performance records across all runs.
+    """
+    import multiprocessing as mp
+    from functools import partial
+
+    cfg = _load_config()
+    freq_norm = _normalize_freq(freq)
+    freq_suffix = _freq_suffix(freq_norm)
+    version_norm = version.lower()
+    processed_dir = Path(__file__).resolve().parents[1] / "data" / "processed"
+    processed_dir.mkdir(parents=True, exist_ok=True)
+
+    returns_df = _load_returns(freq_norm, processed_dir)
+    returns_df = returns_df.sort_index()
+
+    baseline_panels, forecast_panels = _load_moments(freq_norm, processed_dir, version_norm)
+    cfg_bt = _get_backtest_config(cfg, freq_norm)
+
+    ml_weights_df = None
+    if version_norm in ML_VERSION:
+        ml_weights_df = _load_ml_weights(freq_norm, processed_dir)
+        if ml_weights_df is not None:
+            print(f"[Backtest] Using ML-predicted weights for version={version_norm}")
+        else:
+            print(f"[Backtest] ML weights not available, falling back to baseline optimization")
+
+    asset_list_all = list(returns_df.columns)
+
+    first_valid_moment = baseline_panels.get("mean").dropna(how='all').index[0] if "mean" in baseline_panels and not baseline_panels["mean"].dropna(how='all').empty else None
+
+    if first_valid_moment is not None:
+        index_common = returns_df.loc[first_valid_moment:].index
+    else:
+        index_common = returns_df.index
+
+    rebalance_positions = _rebalance_positions(index_common, cfg_bt)
+    if not rebalance_positions:
+        raise ValueError("No rebalance positions were generated; check window and data alignment.")
+
+    project_root = Path(__file__).resolve().parents[1]
+    results_root = project_root / "results" / "runs"
+    results_root.mkdir(parents=True, exist_ok=True)
+
+    combo_list = list(combo_iterable) if combo_iterable else []
+    if not combo_list:
+        _ensure_utf8_stdout()
+        try:
+            combos_dict = cache_combinations()
+            for size_key, combo_group in combos_dict.items():
+                print(f"Group size {size_key}: {len(combo_group)} combinations")
+            print("\u2705 Full combination generator ready")
+            order = ["2", "3", "5"]
+            combo_list = [c for key in order for c in combos_dict.get(key, [])]
+        except Exception as exc:
+            warnings.warn(f"Combination cache unavailable: {exc}. Proceeding with single full-universe run.")
+            combo_list = [None]
+
+    # Create all (combo, model) pairs
+    tasks = []
+    for combo in combo_list:
+        for model_name in model_list:
+            task_args = (
+                combo, model_name, freq_norm, version_norm, returns_df, baseline_panels,
+                forecast_panels, ml_weights_df, index_common, rebalance_positions, cfg_bt,
+                cfg, asset_list_all, results_root, freq_suffix
+            )
+            tasks.append(task_args)
+
+    total_tasks = len(tasks)
+    print(f"[Parallel Backtest] Processing {total_tasks} tasks ({len(combo_list)} combos × {len(model_list)} models)")
+
+    # Determine number of workers
+    if n_jobs == -1:
+        n_workers = mp.cpu_count()
+    else:
+        n_workers = min(n_jobs, mp.cpu_count())
+
+    print(f"[Parallel Backtest] Using {n_workers} worker processes")
+
+    # Process in parallel
+    all_runs: List[pd.DataFrame] = []
+    with mp.Pool(processes=n_workers) as pool:
+        # Use imap_unordered for progress tracking
+        results = pool.imap_unordered(_process_single_combo_model, tasks)
+
+        for i, result in enumerate(results, 1):
+            if result is not None:
+                all_runs.append(result)
+            if i % 100 == 0 or i == total_tasks:
+                print(f"[Parallel Backtest] Completed {i}/{total_tasks} tasks ({100*i/total_tasks:.1f}%)")
+
+    if not all_runs:
+        return pd.DataFrame()
+
+    combined = pd.concat(all_runs, ignore_index=True)
+    # Skip sorting - not needed for groupby and causes MemoryError on large datasets (46M+ rows)
+    # combined = combined.sort_values(["combo", "model", "timestamp"])
     return combined
 
 

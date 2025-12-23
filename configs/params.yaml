@@ -25,11 +25,11 @@ portfolio:
   allow_short: false
   long_only: true
   min_weight: 0.0
-  max_weight: 0.30
+  max_weight: 0.50
   target_leverage: 1.0
   cvar_alpha: 0.95
   weight_bounds:
-    default: [0.0, 0.30]
+    default: [0.0, 0.50]
 
 models:
   random_seed: 42
@@ -37,6 +37,11 @@ models:
     primary: ECOS
     secondary: SCS
     tolerance: 1.0e-6
+    options:
+      abstol: 1.0e-6
+      reltol: 1.0e-5
+      feastol: 1.0e-6
+      max_iters: 200
   objectives:
     mv:
       lambda_mean: 1.0

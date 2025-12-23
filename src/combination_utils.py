@@ -19,7 +19,7 @@ from typing import Dict, Iterable, List, Sequence, Tuple
 import yaml
 
 DEFAULT_CONFIG_PATH = Path("configs/assets.yaml")
-DEFAULT_OUTPUT_PATH = Path("data/meta/combnatons.pkl")
+DEFAULT_OUTPUT_PATH = Path("data/meta/combinations.pkl")
 DEFAULT_GROUP_SIZES: Tuple[int, ...] = (2, 3, 5)
 
 
@@ -89,9 +89,9 @@ def load_assets_from_config(config_path: Path | str = DEFAULT_CONFIG_PATH) -> Li
     return list(dict.fromkeys(assets))
 
 
-def get_all_combnatons(
+def get_all_combinations(
     assets: Sequence[str],
-    group_szes: Sequence[int] = DEFAULT_GROUP_SIZES,
+    group_sizes: Sequence[int] = DEFAULT_GROUP_SIZES,
 ) -> Dict[str, List[Tuple[str, ...]]]:
     """Generate all combinations for the provided assets and group sizes.
 
@@ -99,7 +99,7 @@ def get_all_combnatons(
     ----------
     assets : Sequence[str]
         Asset identifiers to be grouped.
-    group_szes : Sequence[int], optional
+    group_sizes : Sequence[int], optional
         Collection of target combination sizes. Defaults to ``(2, 3, 5)``.
 
     Returns
@@ -118,14 +118,14 @@ def get_all_combnatons(
           universes to avoid materializing every combination in memory.
     """
 
-    if not group_szes:
+    if not group_sizes:
         raise ValueError("At least one group size must be provided.")
 
     unique_assets = list(dict.fromkeys(assets))
     if not unique_assets:
         raise ValueError("Asset sequence must contain at least one identifier.")
 
-    max_size = max(group_szes)
+    max_size = max(group_sizes)
     if max_size > len(unique_assets):
         raise ValueError(
             f"Requested combination size {max_size} exceeds asset count "
@@ -133,7 +133,7 @@ def get_all_combnatons(
         )
 
     combinations_by_size: Dict[str, List[Tuple[str, ...]]] = {}
-    for size in group_szes:
+    for size in group_sizes:
         if size < 1:
             raise ValueError(f"Combination size must be positive, received {size}.")
         if size > len(unique_assets):
@@ -164,7 +164,7 @@ def _ensure_utf8_stdout() -> None:
 def cache_combinations(
     config_path: Path | str = DEFAULT_CONFIG_PATH,
     output_path: Path | str = DEFAULT_OUTPUT_PATH,
-    group_szes: Sequence[int] = DEFAULT_GROUP_SIZES,
+    group_sizes: Sequence[int] = DEFAULT_GROUP_SIZES,
 ) -> Dict[str, List[Tuple[str, ...]]]:
     """Generate and persist combinations, caching to disk if missing.
 
@@ -175,8 +175,8 @@ def cache_combinations(
         ``configs/assets.yaml``.
     output_path : Path | str, optional
         Destination pickle path used as on-disk cache. Defaults to
-        ``data/meta/combnatons.pkl``.
-    group_szes : Sequence[int], optional
+        ``data/meta/combinations.pkl``.
+    group_sizes : Sequence[int], optional
         Combination sizes to materialize. Defaults to ``(2, 3, 5)``.
 
     Returns
@@ -190,7 +190,7 @@ def cache_combinations(
     """
 
     assets = load_assets_from_config(config_path)
-    combinations_by_size = get_all_combnatons(assets, group_szes)
+    combinations_by_size = get_all_combinations(assets, group_sizes)
 
     destination = Path(output_path)
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -217,7 +217,7 @@ def main() -> None:
     print("✅ Full combination generator ready")
 
 
-__all__ = ["load_assets_from_config", "get_all_combnatons", "cache_combinations"]
+__all__ = ["load_assets_from_config", "get_all_combinations", "cache_combinations"]
 
 
 if __name__ == "__main__":
