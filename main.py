@@ -779,7 +779,7 @@ def run_pipeline(
                 else:
                     print(f"[Student] No results generated")
 
-          gi  except ImportError as e:
+            except ImportError as e:
                 print(f"[Student] ML weights module not available: {e}")
                 print("[Student] Skipping ML weight learning")
 
