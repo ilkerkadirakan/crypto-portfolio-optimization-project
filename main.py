@@ -623,7 +623,9 @@ def run_pipeline(
                 ml_weights.train_weight_models(
                     teacher_results=teacher_results,
                     processed_dir=paths["processed"],
-                    freq=freq
+                    freq=freq,
+                    use_ensemble=False,
+                    model_types=['xgb']  # Use only XGBoost
                 )
                 print("[Student] ML weight models trained successfully")
 
@@ -777,7 +779,7 @@ def run_pipeline(
                 else:
                     print(f"[Student] No results generated")
 
-            except ImportError as e:
+          gi  except ImportError as e:
                 print(f"[Student] ML weights module not available: {e}")
                 print("[Student] Skipping ML weight learning")
 

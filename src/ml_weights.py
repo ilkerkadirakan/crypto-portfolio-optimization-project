@@ -25,7 +25,7 @@ except ImportError:
     XGB_AVAILABLE = False
 
 # Constants
-LAG_WINDOWS = 10  # Back to 10 for ensemble approach
+LAG_WINDOWS = 15  # Increased from 10 for more historical patterns
 TOP_K_ASSETS = {2, 3, 5}  # Valid portfolio sizes
 MAX_WEIGHT = 0.30  # Maximum weight per asset
 
@@ -285,7 +285,7 @@ def train_weight_models(
     print(f"[ML-Weights] Training data shape: {merged_df.shape}")
 
     # Split features and targets
-    X = merged_df.drop(columns=weight_cols).fillna(0)
+    X = merged_df.drop(columns=weight_cols + ['combo', 'model']).fillna(0)
     y = merged_df[weight_cols].fillna(0)
 
     # Set default model types
@@ -323,32 +323,39 @@ def train_weight_models(
                 if model_type == 'lgb':
                     model = LGBMRegressor(
                         objective='regression',
-                        learning_rate=0.05,
-                        num_leaves=31,
-                        n_estimators=300,
-                        subsample=0.8,
-                        colsample_bytree=0.8,
+                        learning_rate=0.03,      # Lower learning rate
+                        num_leaves=63,           # More leaves for complexity
+                        n_estimators=500,        # More estimators
+                        subsample=0.85,
+                        colsample_bytree=0.85,
+                        reg_alpha=0.1,           # L1 regularization
+                        reg_lambda=0.1,          # L2 regularization
+                        min_child_samples=20,    # Prevent overfitting
                         random_state=42,
                         verbose=-1
                     )
                 elif model_type == 'xgb' and XGB_AVAILABLE:
                     model = xgb.XGBRegressor(
                         objective='reg:squarederror',
-                        learning_rate=0.05,
-                        max_depth=6,
-                        n_estimators=300,
-                        subsample=0.8,
-                        colsample_bytree=0.8,
+                        learning_rate=0.03,  # Lower learning rate for better convergence
+                        max_depth=8,         # Deeper trees for more complex patterns
+                        n_estimators=500,    # More trees for better learning
+                        subsample=0.85,
+                        colsample_bytree=0.85,
+                        reg_alpha=0.1,       # L1 regularization
+                        reg_lambda=0.1,      # L2 regularization
                         random_state=42,
                         verbosity=0
                     )
                 elif model_type == 'rf':
                     model = RandomForestRegressor(
-                        n_estimators=200,
-                        max_depth=10,
-                        min_samples_split=5,
-                        min_samples_leaf=2,
-                        max_features='sqrt',
+                        n_estimators=300,        # More trees
+                        max_depth=15,            # Deeper trees
+                        min_samples_split=3,     # Lower split threshold
+                        min_samples_leaf=1,      # Lower leaf threshold
+                        max_features='log2',     # Different feature selection
+                        bootstrap=True,
+                        oob_score=True,          # Out-of-bag scoring
                         random_state=42,
                         n_jobs=-1
                     )
@@ -446,13 +453,13 @@ def train_weight_models(
                     pred = model.predict(X.values)
                     ensemble_preds.append(pred)
 
-                    # Weight different models
+                    # Improved ensemble weighting strategy
                     if model_type == 'xgb':
-                        weights.append(0.4)  # Higher weight for XGBoost
+                        weights.append(0.45)  # XGBoost generally best for structured data
                     elif model_type == 'lgb':
-                        weights.append(0.4 if 'xgb' not in model_data else 0.35)
+                        weights.append(0.35)  # LightGBM second best
                     else:  # RandomForest
-                        weights.append(0.25)
+                        weights.append(0.20)  # RF for diversity
 
                 # Normalize weights
                 weights = np.array(weights)
