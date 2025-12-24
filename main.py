@@ -624,8 +624,8 @@ def run_pipeline(
                     teacher_results=teacher_results,
                     processed_dir=paths["processed"],
                     freq=freq,
-                    use_ensemble=False,
-                    model_types=['xgb']  # Use only XGBoost
+                    use_ensemble=True,
+                    model_types=['lgb', 'xgb', 'rf']  # Use ensemble of all models
                 )
                 print("[Student] ML weight models trained successfully")
 
