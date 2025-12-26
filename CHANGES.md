@@ -199,6 +199,26 @@ __all__ = [
    → Genel kazananı belirle
 ```
 
+---
+
+## 📅 2025-12-26 Güncellemeleri
+
+### ✅ Pipeline ve Backtest
+- **Annualization 365:** Tüm raporlama ve teacher ranking yıllıklandırma 365 gün.
+- **Checkpoint düzeltmesi:** Resume artık combo+model bazlı doğru devam ediyor.
+- **ML ağırlıkları kullanımı:** Student backtest’te ML ağırlıkları gerçekten uygulanıyor.
+
+### ✅ Student ML (XGBoost + Multi-Output)
+- **Multi-output XGB:** Tek modelle tüm ağırlıklar birlikte öğreniliyor.
+- **Yeni bayraklar:** `--xgb-multi-output`, `--models`, `--combo-limit`, `--n-lags`.
+- **Deney arşivi:** ML ağırlıkları hash’lenip `results/attempts` altına kaydediliyor.
+
+### ✅ Kalite ve Esneklik
+- **Teacher seçim esnekliği:** Top‑K teacher ve aynı asset sayısı filtresi.
+- **Augmentation:** Opsiyonel gürültü ile target çeşitlendirme.
+- **Softmax temperature:** Tahmin ağırlıklarını yumuşatma opsiyonu.
+- **Model kaydetme fallback:** Yazma izni yoksa `ml_models_user` kullanımı.
+
 **Avantajlar:**
 - ✅ TÜM kombinasyonlar ML ile test edilir
 - ✅ Moment forecasting hatası yok (doğrudan weight learning)
