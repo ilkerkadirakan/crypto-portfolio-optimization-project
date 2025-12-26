@@ -36,11 +36,11 @@ def recalculate_teacher_ranking(freq="1D"):
 
     teacher_grouped = teacher_results.groupby(['combo', 'model'])['net_return'].agg(['mean', 'std', 'count'])
 
-    # CORRECT formula: annualized Sharpe = (mean / std) * sqrt(252)
+    # Annualized Sharpe using 365-day convention
     daily_sharpe = teacher_grouped['mean'] / (teacher_grouped['std'] + 1e-10)
-    teacher_grouped['sharpe'] = daily_sharpe * np.sqrt(252)  # Annualized Sharpe
-    teacher_grouped['annualized_return'] = teacher_grouped['mean'] * 252
-    teacher_grouped['volatility'] = teacher_grouped['std'] * np.sqrt(252)
+    teacher_grouped['sharpe'] = daily_sharpe * np.sqrt(365)
+    teacher_grouped['annualized_return'] = teacher_grouped['mean'] * 365
+    teacher_grouped['volatility'] = teacher_grouped['std'] * np.sqrt(365)
 
     teacher_ranking = teacher_grouped.sort_values('sharpe', ascending=False).reset_index()
 

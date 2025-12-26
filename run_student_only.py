@@ -10,6 +10,8 @@ from src import ml_weights, backtest_engine, combination_utils
 import json
 import warnings
 from collections import defaultdict
+import hashlib
+import datetime as dt
 
 # Suppress cvxpy and sklearn warnings
 warnings.filterwarnings('ignore', category=UserWarning, module='cvxpy')
@@ -106,6 +108,24 @@ def _save_large_parquet(df: pd.DataFrame, file_path: Path, chunk_size: int = 500
     print(f"[SaveChunk] ✓ Completed chunked save to {file_path}")
 
 
+def _hash_file(path: Path) -> str:
+    """Compute a SHA256 hash for a file without loading it all into memory."""
+    hasher = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def _archive_file(src: Path, dest_dir: Path, stem_suffix: str) -> None:
+    """Copy a file into the attempt archive directory with a suffix."""
+    if not src.exists():
+        return
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / f"{src.stem}_{stem_suffix}{src.suffix}"
+    dest.write_bytes(src.read_bytes())
+
+
 def _get_completed_combos(checkpoint_df: pd.DataFrame) -> set:
     """Extract completed combo+model pairs from checkpoint."""
     if checkpoint_df.empty:
@@ -125,7 +145,22 @@ def _get_completed_combos(checkpoint_df: pd.DataFrame) -> set:
     return completed
 
 
-def run_student_only(freq="1D", checkpoint_batch_size=500):
+def run_student_only(
+    freq="1D",
+    checkpoint_batch_size=500,
+    model_choice="ensemble",
+    combo_limit=None,
+    combo_sizes=None,
+    top_k_teachers=1,
+    same_asset_count=False,
+    disable_checkpoint=True,
+    model_list=None,
+    n_lags=15,
+    noise_std=0.0,
+    noise_samples=0,
+    xgb_multi_output=False,
+    softmax_temp=1.0,
+):
     """
     Train and evaluate Student models using pre-computed Teacher results.
 
@@ -153,8 +188,15 @@ def run_student_only(freq="1D", checkpoint_batch_size=500):
     # Load combinations
     combos_by_size = combination_utils.cache_combinations()
     combos = []
-    for size_key in sorted(combos_by_size.keys()):
-        combos.extend(combos_by_size[size_key])
+    if combo_sizes:
+        size_keys = [str(size) for size in combo_sizes]
+    else:
+        size_keys = sorted(combos_by_size.keys())
+    for size_key in size_keys:
+        combos.extend(combos_by_size.get(size_key, []))
+
+    if combo_limit is not None:
+        combos = combos[:max(combo_limit, 0)]
 
     print(f"[Student-Only] Found {len(combos)} portfolio combinations")
 
@@ -164,30 +206,66 @@ def run_student_only(freq="1D", checkpoint_batch_size=500):
     print("="*80)
 
     from src import ml_weights
-    print("[Student] Training ML ensemble models to learn portfolio weights...")
+    if model_choice == "ensemble":
+        use_ensemble = True
+        model_types = ["lgb", "xgb", "rf"]
+        label = "ensemble"
+    elif model_choice == "xgb":
+        use_ensemble = False
+        model_types = ["xgb"]
+        label = "XGBoost"
+    else:
+        use_ensemble = False
+        model_types = ["lgb"]
+        label = "LightGBM"
+
+    print(f"[Student] Training ML {label} models to learn portfolio weights...")
     ml_weights.train_weight_models(
         teacher_results=teacher_results,
         processed_dir=processed_dir,
         freq=freq,
-        use_ensemble=True,  # Enable ensemble for better performance
-        model_types=['lgb', 'xgb', 'rf']  # Use all available models
+        use_ensemble=use_ensemble,
+        model_types=model_types,
+        use_multi_output_xgb=xgb_multi_output,
+        softmax_temp=softmax_temp,
+        top_k_teachers=top_k_teachers,
+        same_asset_count=same_asset_count,
+        n_lags=n_lags,
+        noise_std=noise_std,
+        noise_samples=noise_samples,
     )
-    print("[Student] ML ensemble weight models trained successfully")
+    print(f"[Student] ML {label} weight models trained successfully")
+
+    # Archive ML artifacts with a hash so experiments are reproducible
+    timestamp = dt.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    ml_pred_path = processed_dir / f"ml_predicted_weights_{freq.lower()}.parquet"
+    ml_model_path = processed_dir / "ml_models" / f"weight_models_{freq.lower()}.pkl"
+    attempt_hash = _hash_file(ml_pred_path) if ml_pred_path.exists() else "missing"
+    attempt_suffix = f"{timestamp}_{attempt_hash[:8]}"
+    attempts_dir = (project_root / "results" / "attempts" / f"student_{freq.lower()}")
+    _archive_file(ml_pred_path, attempts_dir, attempt_suffix)
+    _archive_file(ml_model_path, attempts_dir, attempt_suffix)
+    print(f"[Student] Archived ML artifacts with id={attempt_suffix}")
 
     # STEP 2: Run Student backtest
     print("\n" + "="*80)
     print("BACKTESTING STUDENT PORTFOLIOS")
     print("="*80)
 
-    model_list = ["MV", "MVSK", "MCVaRSK"]
+    model_list = model_list or ["MV", "MVSK", "MCVaRSK"]
 
     print(f"[Student] Running backtest with ML weights for {len(combos)} combinations...")
     print(f"[Student] Using parallel processing with checkpoint support...")
 
     # CHECKPOINT SYSTEM
     checkpoint_path = _get_checkpoint_path(pipeline_results_dir, freq)
-    checkpoint_df = _load_checkpoint(checkpoint_path)
-    completed_combos = _get_completed_combos(checkpoint_df)
+    if disable_checkpoint:
+        print("[Student] Checkpointing disabled for this run")
+        checkpoint_df = pd.DataFrame()
+        completed_combos = set()
+    else:
+        checkpoint_df = _load_checkpoint(checkpoint_path)
+        completed_combos = _get_completed_combos(checkpoint_df)
 
     if completed_combos:
         print(f"[Student] Found {len(completed_combos)} completed combo+model pairs")
@@ -259,9 +337,10 @@ def run_student_only(freq="1D", checkpoint_batch_size=500):
 
                 all_student_results.append(batch_results)
 
-                # Save checkpoint
-                combined_df = pd.concat(all_student_results, ignore_index=True)
-                _save_checkpoint(combined_df, checkpoint_path)
+                if not disable_checkpoint:
+                    # Save checkpoint
+                    combined_df = pd.concat(all_student_results, ignore_index=True)
+                    _save_checkpoint(combined_df, checkpoint_path)
             else:
                 print(f"[Warning] Batch {batch_start//checkpoint_batch_size + 1} produced no results")
 
@@ -279,7 +358,7 @@ def run_student_only(freq="1D", checkpoint_batch_size=500):
     student_path = pipeline_results_dir / f"student_{freq.lower()}.parquet"
 
     # If using only checkpoint data, skip expensive save operation
-    if len(remaining_combos) == 0 and not checkpoint_df.empty:
+    if len(remaining_combos) == 0 and not checkpoint_df.empty and not disable_checkpoint:
         print(f"[Student] All data from checkpoint ({len(student_results)} rows)")
         print(f"[Student] Skipping save to avoid memory issues - using checkpoint data for analysis")
         # Create a note file about the location
@@ -317,9 +396,9 @@ def run_student_only(freq="1D", checkpoint_batch_size=500):
     student_grouped = student_results.groupby(['combo', 'model'])['net_return'].agg(['mean', 'std', 'count'])
     # Calculate annualized Sharpe ratio
     daily_sharpe = student_grouped['mean'] / (student_grouped['std'] + 1e-10)
-    student_grouped['sharpe'] = daily_sharpe * np.sqrt(252)  # Annualized
-    student_grouped['annualized_return'] = student_grouped['mean'] * 252
-    student_grouped['volatility'] = student_grouped['std'] * np.sqrt(252)
+    student_grouped['sharpe'] = daily_sharpe * np.sqrt(365)
+    student_grouped['annualized_return'] = student_grouped['mean'] * 365
+    student_grouped['volatility'] = student_grouped['std'] * np.sqrt(365)
 
     student_ranking = student_grouped.sort_values('sharpe', ascending=False).reset_index()
 
@@ -361,6 +440,10 @@ def run_student_only(freq="1D", checkpoint_batch_size=500):
         json.dump(student_winner_data, f, indent=2)
     print(f"[Student] Saved winner to {winner_path}")
 
+    # Archive ranking + winner with the same attempt suffix
+    _archive_file(student_ranking_path, attempts_dir, attempt_suffix)
+    _archive_file(winner_path, attempts_dir, attempt_suffix)
+
     # STEP 4: Compare Teacher vs Student
     print("\n" + "="*80)
     print("TEACHER vs STUDENT COMPARISON")
@@ -394,16 +477,112 @@ def run_student_only(freq="1D", checkpoint_batch_size=500):
 
 
 if __name__ == "__main__":
-    import sys
+    import argparse
 
-    # Support both 1D and 1H
-    if len(sys.argv) > 1:
-        freqs = sys.argv[1:]
-    else:
-        freqs = ["1D"]  # Default: process both frequencies
+    parser = argparse.ArgumentParser(
+        description="Run only the Student (ML weight learning) using existing Teacher results."
+    )
+    parser.add_argument(
+        "--freqs",
+        nargs="*",
+        default=["1D"],
+        help="Frequencies to process (e.g. 1D 1H). Default: 1D.",
+    )
+    parser.add_argument(
+        "--model",
+        choices=["xgb", "lgb", "ensemble"],
+        default="ensemble",
+        help="Student model choice. Default: ensemble.",
+    )
+    parser.add_argument(
+        "--combo-limit",
+        type=int,
+        default=None,
+        help="Limit the number of combinations for a fast test.",
+    )
+    parser.add_argument(
+        "--combo-sizes",
+        nargs="*",
+        type=int,
+        default=None,
+        help="Subset combination sizes (e.g. 2 3 5). Defaults to all sizes.",
+    )
+    parser.add_argument(
+        "--top-k-teachers",
+        type=int,
+        default=1,
+        help="Number of top teacher portfolios to use for training (by Sharpe).",
+    )
+    parser.add_argument(
+        "--same-asset-count",
+        action="store_true",
+        help="Restrict top teachers to the same asset count as the best portfolio.",
+    )
+    parser.add_argument(
+        "--no-checkpoint",
+        action="store_true",
+        help="Disable checkpoint loading/saving for this run.",
+    )
+    parser.add_argument(
+        "--checkpoint",
+        action="store_true",
+        help="Enable checkpoint loading/saving for this run.",
+    )
+    parser.add_argument(
+        "--models",
+        nargs="*",
+        default=None,
+        help="Backtest model list (e.g. MVSK or MV MVSK). Default: all.",
+    )
+    parser.add_argument(
+        "--n-lags",
+        type=int,
+        default=15,
+        help="Number of lag windows for feature generation.",
+    )
+    parser.add_argument(
+        "--noise-std",
+        type=float,
+        default=0.0,
+        help="Stddev of Gaussian noise added to teacher weights for augmentation.",
+    )
+    parser.add_argument(
+        "--noise-samples",
+        type=int,
+        default=0,
+        help="Number of noisy copies of the training targets to add.",
+    )
+    parser.add_argument(
+        "--xgb-multi-output",
+        action="store_true",
+        help="Use a single multi-output XGBoost model instead of per-asset models.",
+    )
+    parser.add_argument(
+        "--softmax-temp",
+        type=float,
+        default=1.0,
+        help="Softmax temperature for predicted weights (higher = more uniform).",
+    )
+    args = parser.parse_args()
 
-    for freq in freqs:
+    for freq in args.freqs:
         print("\n" + "="*80)
         print(f"RUNNING STUDENT FOR {freq}")
         print("="*80)
-        run_student_only(freq)
+
+        run_student_only(
+            freq=freq,
+            checkpoint_batch_size=500,
+            model_choice=args.model,
+            combo_limit=args.combo_limit,
+            combo_sizes=args.combo_sizes,
+            top_k_teachers=args.top_k_teachers,
+            same_asset_count=args.same_asset_count,
+            disable_checkpoint=not args.checkpoint,
+            model_list=[m.upper() for m in args.models] if args.models else None,
+            n_lags=args.n_lags,
+            noise_std=args.noise_std,
+            noise_samples=args.noise_samples,
+            xgb_multi_output=args.xgb_multi_output,
+            softmax_temp=args.softmax_temp,
+        )

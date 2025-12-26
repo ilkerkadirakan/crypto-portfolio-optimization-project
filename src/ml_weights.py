@@ -9,6 +9,7 @@ NO moment forecasting - only weight prediction.
 
 from __future__ import annotations
 
+import os
 import warnings
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -18,6 +19,7 @@ import pandas as pd
 from lightgbm import LGBMRegressor
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.ensemble import RandomForestRegressor
+from sklearn.multioutput import MultiOutputRegressor
 try:
     import xgboost as xgb
     XGB_AVAILABLE = True
@@ -216,7 +218,14 @@ def train_weight_models(
     processed_dir: Path,
     freq: str,
     use_ensemble: bool = False,  # New parameter for ensemble control
-    model_types: list = None     # Which models to use
+    model_types: list = None,    # Which models to use
+    use_multi_output_xgb: bool = False,
+    softmax_temp: float = 1.0,
+    top_k_teachers: int = 1,
+    same_asset_count: bool = False,
+    n_lags: int = LAG_WINDOWS,
+    noise_std: float = 0.0,
+    noise_samples: int = 0,
 ) -> None:
     """
     Train ML models to learn portfolio weights from teacher.
@@ -251,27 +260,45 @@ def train_weight_models(
 
     print(f"[ML-Weights] Found {len(asset_list)} assets")
 
-    # Select best teacher portfolio (highest mean return per timestamp)
-    print(f"[ML-Weights] Selecting best teacher portfolio based on Sharpe ratio...")
-    teacher_perf = teacher_results.groupby(['combo', 'model'])['net_return'].agg(['mean', 'std'])
-    # Calculate annualized Sharpe ratio: (mean / std) * sqrt(252)
-    daily_sharpe = teacher_perf['mean'] / (teacher_perf['std'] + 1e-10)
-    teacher_perf['sharpe'] = daily_sharpe * np.sqrt(252)  # Annualized Sharpe
-    best_idx = teacher_perf['sharpe'].idxmax()
+    # Select top teacher portfolios based on Sharpe ratio
+    print("[ML-Weights] Selecting top teacher portfolios based on Sharpe ratio...")
+    teacher_perf = teacher_results.groupby(["combo", "model"])["net_return"].agg(["mean", "std"])
+    daily_sharpe = teacher_perf["mean"] / (teacher_perf["std"] + 1e-10)
+    teacher_perf["sharpe"] = daily_sharpe * np.sqrt(365)
+    teacher_perf = teacher_perf.sort_values("sharpe", ascending=False)
+
+    best_idx = teacher_perf.index[0]
     best_combo, best_model = best_idx
+    print(
+        f"[ML-Weights] Best teacher: combo={best_combo}, model={best_model}, "
+        f"Sharpe={teacher_perf.loc[best_idx, 'sharpe']:.4f}"
+    )
 
-    print(f"[ML-Weights] Best teacher: combo={best_combo}, model={best_model}, Sharpe={teacher_perf.loc[best_idx, 'sharpe']:.4f}")
+    if same_asset_count:
+        target_count = len(str(best_combo).split("_"))
+        teacher_perf = teacher_perf[
+            teacher_perf.index.get_level_values(0).map(lambda c: len(str(c).split("_")) == target_count)
+        ]
+        print(f"[ML-Weights] Restricting to combos with {target_count} assets")
 
-    # Filter teacher weights to only best portfolio
+    top_k = int(top_k_teachers)
+    if top_k <= 0 or top_k >= len(teacher_perf):
+        top_pairs = teacher_perf.index.tolist()
+        print(f"[ML-Weights] Using all {len(top_pairs)} teacher portfolios for training")
+    else:
+        top_pairs = teacher_perf.head(max(top_k, 1)).index.tolist()
+        print(f"[ML-Weights] Using top {len(top_pairs)} teacher portfolios for training")
+
+    # Filter teacher weights to selected portfolios
     teacher_weights_best = teacher_weights[
-        (teacher_weights['combo'] == best_combo) &
-        (teacher_weights['model'] == best_model)
+        teacher_weights.set_index(["combo", "model"]).index.isin(top_pairs)
     ].copy()
 
-    print(f"[ML-Weights] Creating lagged features with {LAG_WINDOWS} lags...")
+    n_lags = max(int(n_lags), 1)
+    print(f"[ML-Weights] Creating lagged features with {n_lags} lags...")
 
     # Create lagged features
-    features_df = _create_lagged_features(moments_df, returns_df, asset_list, LAG_WINDOWS)
+    features_df = _create_lagged_features(moments_df, returns_df, asset_list, n_lags)
 
     print(f"[ML-Weights] Features shape: {features_df.shape}")
 
@@ -285,8 +312,29 @@ def train_weight_models(
     print(f"[ML-Weights] Training data shape: {merged_df.shape}")
 
     # Split features and targets
-    X = merged_df.drop(columns=weight_cols + ['combo', 'model']).fillna(0)
+    X = merged_df.drop(columns=weight_cols + ['combo', 'model'], errors='ignore').fillna(0)
     y = merged_df[weight_cols].fillna(0)
+
+    # Optional noise augmentation to reduce overfitting to exact teacher weights
+    if noise_std > 0 and noise_samples > 0:
+        noise_samples = max(int(noise_samples), 1)
+        y_base = y.to_numpy(dtype=float)
+        x_base = X.to_numpy(dtype=float)
+        augmented_y = [y_base]
+        augmented_x = [x_base]
+
+        for _ in range(noise_samples):
+            noise = np.random.normal(0.0, noise_std, size=y_base.shape)
+            noisy = y_base + noise
+            noisy = np.clip(noisy, 0.0, None)
+            row_sums = noisy.sum(axis=1, keepdims=True)
+            row_sums[row_sums == 0] = 1.0
+            noisy = noisy / row_sums
+            augmented_y.append(noisy)
+            augmented_x.append(x_base)
+
+        X = pd.DataFrame(np.vstack(augmented_x), columns=X.columns)
+        y = pd.DataFrame(np.vstack(augmented_y), columns=y.columns)
 
     # Set default model types
     if model_types is None:
@@ -303,7 +351,22 @@ def train_weight_models(
 
     model_types = [m for m in model_types if m in available_models]
 
-    print(f"[ML-Weights] Training {len(asset_list)} asset models")
+    multi_output_xgb = bool(
+        use_multi_output_xgb
+        and (not use_ensemble)
+        and ('xgb' in model_types)
+        and XGB_AVAILABLE
+    )
+
+    if use_multi_output_xgb and not multi_output_xgb:
+        warnings.warn("[ML-Weights] Multi-output XGB requested but unavailable; falling back to per-asset models.")
+
+    xgb_n_jobs = max(1, (os.cpu_count() or 1))
+
+    if multi_output_xgb:
+        print(f"[ML-Weights] Training single multi-output XGBoost model for {len(asset_list)} assets")
+    else:
+        print(f"[ML-Weights] Training {len(asset_list)} asset models")
     if use_ensemble:
         print(f"[ML-Weights] Using ensemble approach with models: {model_types}")
     else:
@@ -311,109 +374,135 @@ def train_weight_models(
 
     # Train models for each asset
     models = {}
+    if multi_output_xgb:
+        model = xgb.XGBRegressor(
+            objective='reg:squarederror',
+            learning_rate=0.05,
+            max_depth=6,
+            n_estimators=400,
+            min_child_weight=5,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            reg_lambda=0.5,
+            random_state=42,
+            verbosity=0,
+            n_jobs=xgb_n_jobs
+        )
+        multi_model = MultiOutputRegressor(model, n_jobs=1)
+        try:
+            multi_model.fit(X.values, y.values)
+            models["__multi_output_xgb__"] = multi_model
+            print("[ML-Weights]   ✓ Trained multi-output XGBoost model")
+        except Exception as exc:
+            warnings.warn(f"[ML-Weights] Failed to train multi-output XGBoost model: {exc}")
+            return
+    else:
+        for asset_col in weight_cols:
+            asset_name = asset_col.replace('weight_', '')
 
-    for asset_col in weight_cols:
-        asset_name = asset_col.replace('weight_', '')
+            if use_ensemble:
+                # Ensemble approach - multiple models per asset
+                asset_models = {}
 
-        if use_ensemble:
-            # Ensemble approach - multiple models per asset
-            asset_models = {}
+                for model_type in model_types:
+                    if model_type == 'lgb':
+                        model = LGBMRegressor(
+                            objective='regression',
+                            learning_rate=0.03,      # Lower learning rate
+                            num_leaves=63,           # More leaves for complexity
+                            n_estimators=500,        # More estimators
+                            subsample=0.85,
+                            colsample_bytree=0.85,
+                            reg_alpha=0.1,           # L1 regularization
+                            reg_lambda=0.1,          # L2 regularization
+                            min_child_samples=20,    # Prevent overfitting
+                            random_state=42,
+                            verbose=-1
+                        )
+                    elif model_type == 'xgb' and XGB_AVAILABLE:
+                        model = xgb.XGBRegressor(
+                            objective='reg:squarederror',
+                            learning_rate=0.03,  # Lower learning rate for better convergence
+                            max_depth=8,         # Deeper trees for more complex patterns
+                            n_estimators=500,    # More trees for better learning
+                            subsample=0.85,
+                            colsample_bytree=0.85,
+                            reg_alpha=0.1,       # L1 regularization
+                            reg_lambda=0.1,      # L2 regularization
+                            random_state=42,
+                            verbosity=0,
+                            n_jobs=xgb_n_jobs
+                        )
+                    elif model_type == 'rf':
+                        model = RandomForestRegressor(
+                            n_estimators=300,        # More trees
+                            max_depth=15,            # Deeper trees
+                            min_samples_split=3,     # Lower split threshold
+                            min_samples_leaf=1,      # Lower leaf threshold
+                            max_features='log2',     # Different feature selection
+                            bootstrap=True,
+                            oob_score=True,          # Out-of-bag scoring
+                            random_state=42,
+                            n_jobs=-1
+                        )
 
-            for model_type in model_types:
+                    try:
+                        model.fit(X.values, y[asset_col].values)
+                        asset_models[model_type] = model
+                    except Exception as exc:
+                        warnings.warn(f"[ML-Weights] Failed to train {model_type} for {asset_name}: {exc}")
+
+                if asset_models:
+                    models[asset_name] = asset_models
+                    model_names = list(asset_models.keys())
+                    print(f"[ML-Weights]   ✓ Trained ensemble for {asset_name} ({', '.join(model_names)})")
+
+            else:
+                # Single model approach (fast)
+                model_type = model_types[0]
                 if model_type == 'lgb':
                     model = LGBMRegressor(
                         objective='regression',
-                        learning_rate=0.03,      # Lower learning rate
-                        num_leaves=63,           # More leaves for complexity
-                        n_estimators=500,        # More estimators
-                        subsample=0.85,
-                        colsample_bytree=0.85,
-                        reg_alpha=0.1,           # L1 regularization
-                        reg_lambda=0.1,          # L2 regularization
-                        min_child_samples=20,    # Prevent overfitting
+                        learning_rate=0.1,
+                        num_leaves=15,
+                        n_estimators=100,
+                        subsample=0.9,
+                        colsample_bytree=0.9,
                         random_state=42,
-                        verbose=-1
+                        verbose=-1,
+                        n_jobs=1
                     )
                 elif model_type == 'xgb' and XGB_AVAILABLE:
                     model = xgb.XGBRegressor(
                         objective='reg:squarederror',
-                        learning_rate=0.03,  # Lower learning rate for better convergence
-                        max_depth=8,         # Deeper trees for more complex patterns
-                        n_estimators=500,    # More trees for better learning
-                        subsample=0.85,
-                        colsample_bytree=0.85,
-                        reg_alpha=0.1,       # L1 regularization
-                        reg_lambda=0.1,      # L2 regularization
+                        learning_rate=0.05,
+                        max_depth=6,
+                        n_estimators=400,
+                        min_child_weight=5,
+                        subsample=0.8,
+                        colsample_bytree=0.8,
+                        reg_lambda=0.5,
                         random_state=42,
-                        verbosity=0
+                        verbosity=0,
+                        n_jobs=xgb_n_jobs
                     )
                 elif model_type == 'rf':
                     model = RandomForestRegressor(
-                        n_estimators=300,        # More trees
-                        max_depth=15,            # Deeper trees
-                        min_samples_split=3,     # Lower split threshold
-                        min_samples_leaf=1,      # Lower leaf threshold
-                        max_features='log2',     # Different feature selection
-                        bootstrap=True,
-                        oob_score=True,          # Out-of-bag scoring
+                        n_estimators=100,
+                        max_depth=8,
+                        min_samples_split=5,
+                        min_samples_leaf=2,
+                        max_features='sqrt',
                         random_state=42,
                         n_jobs=-1
                     )
 
                 try:
                     model.fit(X.values, y[asset_col].values)
-                    asset_models[model_type] = model
+                    models[asset_name] = model
+                    print(f"[ML-Weights]   ✓ Trained {model_type} model for {asset_name}")
                 except Exception as exc:
-                    warnings.warn(f"[ML-Weights] Failed to train {model_type} for {asset_name}: {exc}")
-
-            if asset_models:
-                models[asset_name] = asset_models
-                model_names = list(asset_models.keys())
-                print(f"[ML-Weights]   ✓ Trained ensemble for {asset_name} ({', '.join(model_names)})")
-
-        else:
-            # Single model approach (fast)
-            model_type = model_types[0]
-            if model_type == 'lgb':
-                model = LGBMRegressor(
-                    objective='regression',
-                    learning_rate=0.1,
-                    num_leaves=15,
-                    n_estimators=100,
-                    subsample=0.9,
-                    colsample_bytree=0.9,
-                    random_state=42,
-                    verbose=-1,
-                    n_jobs=1
-                )
-            elif model_type == 'xgb' and XGB_AVAILABLE:
-                model = xgb.XGBRegressor(
-                    objective='reg:squarederror',
-                    learning_rate=0.1,
-                    max_depth=4,
-                    n_estimators=100,
-                    subsample=0.9,
-                    colsample_bytree=0.9,
-                    random_state=42,
-                    verbosity=0
-                )
-            elif model_type == 'rf':
-                model = RandomForestRegressor(
-                    n_estimators=100,
-                    max_depth=8,
-                    min_samples_split=5,
-                    min_samples_leaf=2,
-                    max_features='sqrt',
-                    random_state=42,
-                    n_jobs=-1
-                )
-
-            try:
-                model.fit(X.values, y[asset_col].values)
-                models[asset_name] = model
-                print(f"[ML-Weights]   ✓ Trained {model_type} model for {asset_name}")
-            except Exception as exc:
-                warnings.warn(f"[ML-Weights] Failed to train model for {asset_name}: {exc}")
+                    warnings.warn(f"[ML-Weights] Failed to train model for {asset_name}: {exc}")
 
     if use_ensemble:
         print(f"[ML-Weights] Successfully trained ensemble models for {len(models)} assets")
@@ -426,14 +515,29 @@ def train_weight_models(
     models_dir.mkdir(parents=True, exist_ok=True)
 
     models_path = models_dir / f"weight_models_{freq.lower()}.pkl"
-    joblib.dump({
-        'models': models,
-        'asset_list': asset_list,
-        'feature_cols': list(X.columns),
-        'freq': freq
-    }, models_path)
-
-    print(f"[ML-Weights] Saved models to {models_path}")
+    try:
+        joblib.dump({
+            'models': models,
+            'asset_list': asset_list,
+            'feature_cols': list(X.columns),
+            'freq': freq,
+            'multi_output_xgb': multi_output_xgb
+        }, models_path)
+        print(f"[ML-Weights] Saved models to {models_path}")
+    except PermissionError as exc:
+        alt_models_dir = processed_dir / "ml_models_user"
+        alt_models_dir.mkdir(parents=True, exist_ok=True)
+        alt_models_path = alt_models_dir / f"weight_models_{freq.lower()}.pkl"
+        joblib.dump({
+            'models': models,
+            'asset_list': asset_list,
+            'feature_cols': list(X.columns),
+            'freq': freq,
+            'multi_output_xgb': multi_output_xgb
+        }, alt_models_path)
+        warnings.warn(
+            f"[ML-Weights] Failed to write {models_path} ({exc}); saved to {alt_models_path} instead."
+        )
 
     # Generate predictions
     if use_ensemble:
@@ -442,42 +546,62 @@ def train_weight_models(
         print(f"[ML-Weights] Generating weight predictions...")
 
     predictions = {}
-    for asset_name, model_data in models.items():
+    if multi_output_xgb and "__multi_output_xgb__" in models:
+        model = models["__multi_output_xgb__"]
         try:
-            if use_ensemble and isinstance(model_data, dict):
-                # Ensemble prediction - average multiple models
-                ensemble_preds = []
-                weights = []
-
-                for model_type, model in model_data.items():
-                    pred = model.predict(X.values)
-                    ensemble_preds.append(pred)
-
-                    # Improved ensemble weighting strategy
-                    if model_type == 'xgb':
-                        weights.append(0.45)  # XGBoost generally best for structured data
-                    elif model_type == 'lgb':
-                        weights.append(0.35)  # LightGBM second best
-                    else:  # RandomForest
-                        weights.append(0.20)  # RF for diversity
-
-                # Normalize weights
-                weights = np.array(weights)
-                weights = weights / weights.sum()
-
-                # Weighted ensemble prediction
-                ensemble_pred = np.average(ensemble_preds, axis=0, weights=weights)
-                predictions[f'pred_weight_{asset_name}'] = ensemble_pred
-
-            else:
-                # Single model prediction
-                pred = model_data.predict(X.values)
-                predictions[f'pred_weight_{asset_name}'] = pred
-
+            preds = model.predict(X.values)
+            for idx, asset_name in enumerate(asset_list):
+                predictions[f'pred_weight_{asset_name}'] = preds[:, idx]
         except Exception as exc:
-            warnings.warn(f"[ML-Weights] Failed to predict for {asset_name}: {exc}")
+            warnings.warn(f"[ML-Weights] Failed to predict with multi-output XGBoost: {exc}")
+            return
+    else:
+        for asset_name, model_data in models.items():
+            try:
+                if use_ensemble and isinstance(model_data, dict):
+                    # Ensemble prediction - average multiple models
+                    ensemble_preds = []
+                    weights = []
+
+                    for model_type, model in model_data.items():
+                        pred = model.predict(X.values)
+                        ensemble_preds.append(pred)
+
+                        # Improved ensemble weighting strategy
+                        if model_type == 'xgb':
+                            weights.append(0.45)  # XGBoost generally best for structured data
+                        elif model_type == 'lgb':
+                            weights.append(0.35)  # LightGBM second best
+                        else:  # RandomForest
+                            weights.append(0.20)  # RF for diversity
+
+                    # Normalize weights
+                    weights = np.array(weights)
+                    weights = weights / weights.sum()
+
+                    # Weighted ensemble prediction
+                    ensemble_pred = np.average(ensemble_preds, axis=0, weights=weights)
+                    predictions[f'pred_weight_{asset_name}'] = ensemble_pred
+
+                else:
+                    # Single model prediction
+                    pred = model_data.predict(X.values)
+                    predictions[f'pred_weight_{asset_name}'] = pred
+
+            except Exception as exc:
+                warnings.warn(f"[ML-Weights] Failed to predict for {asset_name}: {exc}")
 
     pred_df = pd.DataFrame(predictions, index=X.index)
+
+    softmax_temp = float(softmax_temp)
+    if softmax_temp != 1.0 and softmax_temp > 0:
+        pred_vals = pred_df.to_numpy(dtype=float)
+        pred_vals = pred_vals / softmax_temp
+        pred_vals = pred_vals - np.max(pred_vals, axis=1, keepdims=True)
+        exp_vals = np.exp(pred_vals)
+        denom = np.sum(exp_vals, axis=1, keepdims=True)
+        denom[denom == 0] = 1.0
+        pred_df = pd.DataFrame(exp_vals / denom, index=pred_df.index, columns=pred_df.columns)
 
     # Save predictions
     pred_path = processed_dir / f"ml_predicted_weights_{freq.lower()}.parquet"

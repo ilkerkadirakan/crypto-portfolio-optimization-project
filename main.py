@@ -90,6 +90,16 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=500,
         help="Save checkpoint every N combinations (default: 500).",
     )
+    parser.add_argument(
+        "--skip-prep",
+        action="store_true",
+        help="Skip data preparation step if processed returns already exist.",
+    )
+    parser.add_argument(
+        "--skip-moments",
+        action="store_true",
+        help="Skip moment calculation if moments parquet files already exist.",
+    )
     return parser.parse_args(argv)
 
 
@@ -394,9 +404,9 @@ def _get_completed_combos(checkpoint_df: pd.DataFrame) -> set:
         return set()
 
     completed = set()
-    for _, group in checkpoint_df.groupby(['combo', 'model']):
-        combo = group['combo'].iloc[0]
-        model = group['model'].iloc[0]
+    for _, group in checkpoint_df.groupby(["combo", "model"]):
+        combo = group["combo"].iloc[0]
+        model = str(group["model"].iloc[0]).upper()
         completed.add((combo, model))
 
     return completed
@@ -411,6 +421,8 @@ def run_pipeline(
     use_parallel: bool = True,
     resume: bool = False,
     checkpoint_batch_size: int = 500,
+    skip_prep: bool = False,
+    skip_moments: bool = False,
 ) -> None:
     """
     Execute the full portfolio optimization workflow with checkpoint support.
@@ -456,11 +468,17 @@ def run_pipeline(
     backtest_cfg = config.get("backtest", {}) if isinstance(config, dict) else {}
     combos: List[object] = _resolve_combo_iterable(backtest_cfg)
 
-    print("[main] Starting data preparation step.")
-    data_prep.prepare_data(raw_data_dir=paths["raw"], processed_dir=paths["processed"])
+    if skip_prep:
+        print("[main] Skipping data preparation step (skip-prep enabled).")
+    else:
+        print("[main] Starting data preparation step.")
+        data_prep.prepare_data(raw_data_dir=paths["raw"], processed_dir=paths["processed"])
 
-    print("[main] Computing realized statistical moments.")
-    moment_calc.calc_all_moments(processed_dir=paths["processed"])
+    if skip_moments:
+        print("[main] Skipping moment calculation (skip-moments enabled).")
+    else:
+        print("[main] Computing realized statistical moments.")
+        moment_calc.calc_all_moments(processed_dir=paths["processed"])
 
     pipeline_results_dir = paths["results"] / "pipeline"
     pipeline_results_dir.mkdir(parents=True, exist_ok=True)
@@ -494,53 +512,60 @@ def run_pipeline(
             checkpoint_df = pd.DataFrame()
             completed_combos = set()
 
-        # Filter remaining combinations
-        remaining_combos = []
+        # Filter remaining combinations per model
+        remaining_by_model = {model: [] for model in model_list}
         for combo in combos:
-            combo_str = "_".join(sorted(combo)) if isinstance(combo, (list, tuple)) else str(combo)
-            # Check if all models are completed for this combo
-            models_needed = [m for m in model_list if (combo_str, m) not in completed_combos]
-            if models_needed:
-                remaining_combos.append(combo)
+            combo_str = backtest_engine._combo_label(combo)
+            for model in model_list:
+                if (combo_str, model) not in completed_combos:
+                    remaining_by_model[model].append(combo)
 
-        print(f"[Teacher] Remaining combinations to process: {len(remaining_combos)}/{len(combos)}")
+        remaining_total = sum(len(items) for items in remaining_by_model.values())
+        print(f"[Teacher] Remaining combo+model pairs to process: {remaining_total}")
+        for model in model_list:
+            print(f"[Teacher]   {model}: {len(remaining_by_model[model])}/{len(combos)} combos")
 
-        if not remaining_combos and not checkpoint_df.empty:
-            print(f"[Teacher] All combinations already completed (using checkpoint)")
+        if remaining_total == 0 and not checkpoint_df.empty:
+            print("[Teacher] All combinations already completed (using checkpoint)")
             teacher_results = checkpoint_df
         else:
             # Process in batches with checkpoints
             all_teacher_results = [checkpoint_df] if not checkpoint_df.empty else []
 
-            for batch_start in range(0, len(remaining_combos), checkpoint_batch_size):
-                batch_end = min(batch_start + checkpoint_batch_size, len(remaining_combos))
-                batch_combos = remaining_combos[batch_start:batch_end]
+            for model in model_list:
+                remaining_combos = remaining_by_model[model]
+                if not remaining_combos:
+                    continue
 
-                print(f"\n[Teacher] Processing batch {batch_start//checkpoint_batch_size + 1}: "
-                      f"combos {batch_start+1}-{batch_end}/{len(remaining_combos)}")
+                for batch_start in range(0, len(remaining_combos), checkpoint_batch_size):
+                    batch_end = min(batch_start + checkpoint_batch_size, len(remaining_combos))
+                    batch_combos = remaining_combos[batch_start:batch_end]
 
-                if use_parallel:
-                    batch_results = backtest_engine.run_backtest_parallel(
-                        freq=freq,
-                        version="baseline",
-                        model_list=model_list,
-                        combo_iterable=batch_combos,
-                        n_jobs=n_jobs,
-                    )
-                else:
-                    batch_results = backtest_engine.run_backtest(
-                        freq=freq,
-                        version="baseline",
-                        model_list=model_list,
-                        combo_iterable=batch_combos,
-                    )
+                    print(f"\n[Teacher] Processing {model} batch {batch_start//checkpoint_batch_size + 1}: "
+                          f"combos {batch_start+1}-{batch_end}/{len(remaining_combos)}")
 
-                if not batch_results.empty:
-                    all_teacher_results.append(batch_results)
+                    if use_parallel:
+                        batch_results = backtest_engine.run_backtest_parallel(
+                            freq=freq,
+                            version="baseline",
+                            model_list=[model],
+                            combo_iterable=batch_combos,
+                            n_jobs=n_jobs,
+                        )
+                    else:
+                        batch_results = backtest_engine.run_backtest(
+                            freq=freq,
+                            version="baseline",
+                            model_list=[model],
+                            combo_iterable=batch_combos,
+                        )
 
-                    # Save checkpoint
-                    combined_df = pd.concat(all_teacher_results, ignore_index=True)
-                    _save_checkpoint(combined_df, checkpoint_path)
+                    if not batch_results.empty:
+                        all_teacher_results.append(batch_results)
+
+                        # Save checkpoint
+                        combined_df = pd.concat(all_teacher_results, ignore_index=True)
+                        _save_checkpoint(combined_df, checkpoint_path)
 
             # Combine all results
             if all_teacher_results:
@@ -563,11 +588,11 @@ def run_pipeline(
 
         import numpy as np
         teacher_grouped = teacher_results.groupby(['combo', 'model'])['net_return'].agg(['mean', 'std', 'count'])
-        # Calculate annualized Sharpe ratio: (mean / std) * sqrt(252)
+        # Calculate annualized Sharpe ratio using 365-day convention
         daily_sharpe = teacher_grouped['mean'] / (teacher_grouped['std'] + 1e-10)
-        teacher_grouped['sharpe'] = daily_sharpe * np.sqrt(252)  # Annualized Sharpe
-        teacher_grouped['annualized_return'] = teacher_grouped['mean'] * 252
-        teacher_grouped['volatility'] = teacher_grouped['std'] * np.sqrt(252)
+        teacher_grouped['sharpe'] = daily_sharpe * np.sqrt(365)
+        teacher_grouped['annualized_return'] = teacher_grouped['mean'] * 365
+        teacher_grouped['volatility'] = teacher_grouped['std'] * np.sqrt(365)
 
         teacher_ranking = teacher_grouped.sort_values('sharpe', ascending=False).reset_index()
 
@@ -643,52 +668,60 @@ def run_pipeline(
                     checkpoint_df_student = pd.DataFrame()
                     completed_combos_student = set()
 
-                # Filter remaining combinations for student
-                remaining_combos_student = []
+                # Filter remaining combinations per model for student
+                remaining_by_model_student = {model: [] for model in model_list}
                 for combo in combos:
-                    combo_str = "_".join(sorted(combo)) if isinstance(combo, (list, tuple)) else str(combo)
-                    models_needed = [m for m in model_list if (combo_str, m) not in completed_combos_student]
-                    if models_needed:
-                        remaining_combos_student.append(combo)
+                    combo_str = backtest_engine._combo_label(combo)
+                    for model in model_list:
+                        if (combo_str, model) not in completed_combos_student:
+                            remaining_by_model_student[model].append(combo)
 
-                print(f"[Student] Remaining combinations to process: {len(remaining_combos_student)}/{len(combos)}")
+                remaining_total_student = sum(len(items) for items in remaining_by_model_student.values())
+                print(f"[Student] Remaining combo+model pairs to process: {remaining_total_student}")
+                for model in model_list:
+                    print(f"[Student]   {model}: {len(remaining_by_model_student[model])}/{len(combos)} combos")
 
-                if not remaining_combos_student and not checkpoint_df_student.empty:
-                    print(f"[Student] All combinations already completed (using checkpoint)")
+                if remaining_total_student == 0 and not checkpoint_df_student.empty:
+                    print("[Student] All combinations already completed (using checkpoint)")
                     student_results = checkpoint_df_student
                 else:
                     # Process in batches with checkpoints
                     all_student_results = [checkpoint_df_student] if not checkpoint_df_student.empty else []
 
-                    for batch_start in range(0, len(remaining_combos_student), checkpoint_batch_size):
-                        batch_end = min(batch_start + checkpoint_batch_size, len(remaining_combos_student))
-                        batch_combos = remaining_combos_student[batch_start:batch_end]
+                    for model in model_list:
+                        remaining_combos_student = remaining_by_model_student[model]
+                        if not remaining_combos_student:
+                            continue
 
-                        print(f"\n[Student] Processing batch {batch_start//checkpoint_batch_size + 1}: "
-                              f"combos {batch_start+1}-{batch_end}/{len(remaining_combos_student)}")
+                        for batch_start in range(0, len(remaining_combos_student), checkpoint_batch_size):
+                            batch_end = min(batch_start + checkpoint_batch_size, len(remaining_combos_student))
+                            batch_combos = remaining_combos_student[batch_start:batch_end]
 
-                        if use_parallel:
-                            batch_results = backtest_engine.run_backtest_parallel(
-                                freq=freq,
-                                version="ml",
-                                model_list=model_list,
-                                combo_iterable=batch_combos,
-                                n_jobs=n_jobs,
-                            )
-                        else:
-                            batch_results = backtest_engine.run_backtest(
-                                freq=freq,
-                                version="ml",
-                                model_list=model_list,
-                                combo_iterable=batch_combos,
-                            )
+                            print(f"\n[Student] Processing {model} batch {batch_start//checkpoint_batch_size + 1}: "
+                                  f"combos {batch_start+1}-{batch_end}/{len(remaining_combos_student)}")
 
-                        if not batch_results.empty:
-                            all_student_results.append(batch_results)
+                            if use_parallel:
+                                batch_results = backtest_engine.run_backtest_parallel(
+                                    freq=freq,
+                                    version="ml",
+                                    model_list=[model],
+                                    combo_iterable=batch_combos,
+                                    n_jobs=n_jobs,
+                                )
+                            else:
+                                batch_results = backtest_engine.run_backtest(
+                                    freq=freq,
+                                    version="ml",
+                                    model_list=[model],
+                                    combo_iterable=batch_combos,
+                                )
 
-                            # Save checkpoint
-                            combined_df_student = pd.concat(all_student_results, ignore_index=True)
-                            _save_checkpoint(combined_df_student, checkpoint_path_student)
+                            if not batch_results.empty:
+                                all_student_results.append(batch_results)
+
+                                # Save checkpoint
+                                combined_df_student = pd.concat(all_student_results, ignore_index=True)
+                                _save_checkpoint(combined_df_student, checkpoint_path_student)
 
                     # Combine all results
                     if all_student_results:
@@ -706,11 +739,11 @@ def run_pipeline(
                     print(f"\n STEP 4: Generating STUDENT RANKING for freq={freq}")
 
                     student_grouped = student_results.groupby(['combo', 'model'])['net_return'].agg(['mean', 'std', 'count'])
-                    # Calculate annualized Sharpe ratio: (mean / std) * sqrt(252)
+                    # Calculate annualized Sharpe ratio using 365-day convention
                     daily_sharpe_student = student_grouped['mean'] / (student_grouped['std'] + 1e-10)
-                    student_grouped['sharpe'] = daily_sharpe_student * np.sqrt(252)  # Annualized Sharpe
-                    student_grouped['annualized_return'] = student_grouped['mean'] * 252
-                    student_grouped['volatility'] = student_grouped['std'] * np.sqrt(252)
+                    student_grouped['sharpe'] = daily_sharpe_student * np.sqrt(365)
+                    student_grouped['annualized_return'] = student_grouped['mean'] * 365
+                    student_grouped['volatility'] = student_grouped['std'] * np.sqrt(365)
 
                     student_ranking = student_grouped.sort_values('sharpe', ascending=False).reset_index()
 
@@ -836,6 +869,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             use_parallel=not args.no_parallel,
             resume=args.resume,
             checkpoint_batch_size=args.checkpoint_batch_size,
+            skip_prep=args.skip_prep,
+            skip_moments=args.skip_moments,
         )
         return 0
     except Exception as exc:  # pragma: no cover - defensive guard for CLI usage

@@ -231,6 +231,40 @@ def _sanitize_weights(weights: np.ndarray) -> np.ndarray:
     return weights / total
 
 
+def _extract_ml_weights(
+    ml_weights_df: pd.DataFrame | None,
+    ts: pd.Timestamp,
+    asset_list: Sequence[str],
+) -> Optional[np.ndarray]:
+    """
+    Extract ML-predicted weights for a timestamp and align to the asset list.
+    """
+    if ml_weights_df is None or ml_weights_df.empty:
+        return None
+
+    try:
+        row = _safe_loc(ml_weights_df, ts)
+    except Exception:
+        return None
+
+    weights = []
+    for asset in asset_list:
+        value = None
+        for prefix in ("pred_weight_", "weight_"):
+            col = f"{prefix}{asset}"
+            if col in row.index:
+                value = row[col]
+                break
+        weights.append(np.nan if value is None else float(value))
+
+    arr = np.asarray(weights, dtype=float)
+    arr = np.nan_to_num(arr, nan=0.0)
+    total = arr.sum()
+    if total <= 0:
+        return None
+    return arr / total
+
+
 def _ledoit_covariance(window_returns: pd.DataFrame, assets: Sequence[str]) -> Optional[np.ndarray]:
     """
     Estimate a covariance matrix for the given assets using Ledoit-Wolf shrinkage.
@@ -504,110 +538,125 @@ def run_backtest(
                 end_pos = rebalance_positions[pos_idx + 1] if pos_idx + 1 < len(rebalance_positions) else len(index_common)
                 period_index = index_common[start_pos:end_pos]
 
-                if version_norm in ML_VERSION and forecast_selected:
-                    mu_series, variance_series, skew_series, kurt_series, cvar_series = _prepare_moment_inputs(
-                        ts, asset_list, forecast_selected, baseline_selected
+                use_ml_weights = False
+                if version_norm in ML_VERSION and ml_weights_df is not None:
+                    ml_weights = _extract_ml_weights(ml_weights_df, ts, asset_list)
+                    if ml_weights is not None:
+                        weights_full = _sanitize_weights(ml_weights)
+                    else:
+                        if prev_weights_full.sum() > 0:
+                            weights_full = prev_weights_full.copy()
+                        else:
+                            weights_full = np.full(len(asset_list), 1.0 / len(asset_list))
+                    turnover = float(np.sum(np.abs(weights_full - prev_weights_full)))
+                    transaction_cost = turnover * cfg_bt.transaction_cost
+                    use_ml_weights = True
+
+                if not use_ml_weights:
+                    if version_norm in ML_VERSION and forecast_selected:
+                        mu_series, variance_series, skew_series, kurt_series, cvar_series = _prepare_moment_inputs(
+                            ts, asset_list, forecast_selected, baseline_selected
+                        )
+                    else:
+                        mu_series, variance_series, skew_series, kurt_series, cvar_series = _prepare_moment_inputs(
+                            ts, asset_list, baseline_selected, forecast_selected
+                        )
+
+                    active_mask = (
+                        mu_series.notna()
+                        & variance_series.notna()
+                        & skew_series.notna()
+                        & kurt_series.notna()
+                        & cvar_series.notna()
                     )
-                else:
-                    mu_series, variance_series, skew_series, kurt_series, cvar_series = _prepare_moment_inputs(
-                        ts, asset_list, baseline_selected, forecast_selected
-                    )
 
-                active_mask = (
-                    mu_series.notna()
-                    & variance_series.notna()
-                    & skew_series.notna()
-                    & kurt_series.notna()
-                    & cvar_series.notna()
-                )
-
-                active_assets = [asset for asset, flag in zip(asset_list, active_mask) if flag]
-                if not active_assets:
-                    warnings.warn(f"No valid assets for optimization at {ts}; carrying previous weights.")
-                    weights_full = prev_weights_full.copy()
-                    turnover = 0.0
-                    transaction_cost = 0.0
-                else:
-                    window_slice = returns_subset.iloc[max(0, start_pos - cfg_bt.window + 1):start_pos + 1]
-                    covariance_matrix = _ledoit_covariance(window_slice, active_assets)
-                    if covariance_matrix is None:
-                        covariance_matrix = _diag_covariance(variance_series.loc[active_assets])
-
-                    # Extract moment values for active assets
-                    mu_vals = mu_series.loc[active_assets].values
-                    skew_vals = skew_series.loc[active_assets].values
-                    kurt_vals = kurt_series.loc[active_assets].values
-                    cvar_vals = cvar_series.loc[active_assets].values
-
-                    # Validate inputs before calling solver
-                    input_valid = True
-                    if not (np.isfinite(mu_vals).all() and np.isfinite(skew_vals).all() and
-                            np.isfinite(kurt_vals).all() and np.isfinite(cvar_vals).all()):
-                        input_valid = False
-                    if not np.isfinite(covariance_matrix).all():
-                        input_valid = False
-                    if len(active_assets) < 2:
-                        input_valid = False
-
-                    if not input_valid:
-                        # Track and warn about invalid inputs
-                        failure_key = f"{combo_label}_{model_name}"
-                        if not hasattr(run_backtest, '_failures'):
-                            run_backtest._failures = {}
-                        if failure_key not in run_backtest._failures:
-                            run_backtest._failures[failure_key] = 0
-                        run_backtest._failures[failure_key] += 1
-
-                        if run_backtest._failures[failure_key] == 1:
-                            warnings.warn(
-                                f"Invalid inputs for model '{model_name}' combo '{combo_label}'. "
-                                f"This warning will not repeat for this combination. "
-                                f"Reason: NaN/Inf values or insufficient assets.",
-                                UserWarning,
-                                stacklevel=2
-                            )
+                    active_assets = [asset for asset, flag in zip(asset_list, active_mask) if flag]
+                    if not active_assets:
+                        warnings.warn(f"No valid assets for optimization at {ts}; carrying previous weights.")
                         weights_full = prev_weights_full.copy()
                         turnover = 0.0
                         transaction_cost = 0.0
                     else:
-                        try:
-                            weights_active = solve_portfolio(
-                                model_name=model_name,
-                                mu=mu_vals,
-                                sigma=covariance_matrix,
-                                skew=skew_vals,
-                                kurt=kurt_vals,
-                                cvar_series=cvar_vals,
-                                params=params,
-                            )
-                            weights_active = _sanitize_weights(weights_active)
-                            weights_full = np.zeros(len(asset_list), dtype=float)
-                            for asset, weight in zip(active_assets, weights_active):
-                                weights_full[asset_list.index(asset)] = weight
-                        except Exception as exc:
-                            # Track failures per combo to avoid spam
+                        window_slice = returns_subset.iloc[max(0, start_pos - cfg_bt.window + 1):start_pos + 1]
+                        covariance_matrix = _ledoit_covariance(window_slice, active_assets)
+                        if covariance_matrix is None:
+                            covariance_matrix = _diag_covariance(variance_series.loc[active_assets])
+
+                        # Extract moment values for active assets
+                        mu_vals = mu_series.loc[active_assets].values
+                        skew_vals = skew_series.loc[active_assets].values
+                        kurt_vals = kurt_series.loc[active_assets].values
+                        cvar_vals = cvar_series.loc[active_assets].values
+
+                        # Validate inputs before calling solver
+                        input_valid = True
+                        if not (np.isfinite(mu_vals).all() and np.isfinite(skew_vals).all() and
+                                np.isfinite(kurt_vals).all() and np.isfinite(cvar_vals).all()):
+                            input_valid = False
+                        if not np.isfinite(covariance_matrix).all():
+                            input_valid = False
+                        if len(active_assets) < 2:
+                            input_valid = False
+
+                        if not input_valid:
+                            # Track and warn about invalid inputs
                             failure_key = f"{combo_label}_{model_name}"
                             if not hasattr(run_backtest, '_failures'):
                                 run_backtest._failures = {}
-
                             if failure_key not in run_backtest._failures:
                                 run_backtest._failures[failure_key] = 0
-
                             run_backtest._failures[failure_key] += 1
 
-                            # Only warn on first failure for each combo/model pair
                             if run_backtest._failures[failure_key] == 1:
                                 warnings.warn(
-                                    f"Optimization failed for model '{model_name}' combo '{combo_label}'. "
+                                    f"Invalid inputs for model '{model_name}' combo '{combo_label}'. "
                                     f"This warning will not repeat for this combination. "
-                                    f"Error: {exc}",
+                                    f"Reason: NaN/Inf values or insufficient assets.",
                                     UserWarning,
                                     stacklevel=2
                                 )
                             weights_full = prev_weights_full.copy()
+                            turnover = 0.0
+                            transaction_cost = 0.0
+                        else:
+                            try:
+                                weights_active = solve_portfolio(
+                                    model_name=model_name,
+                                    mu=mu_vals,
+                                    sigma=covariance_matrix,
+                                    skew=skew_vals,
+                                    kurt=kurt_vals,
+                                    cvar_series=cvar_vals,
+                                    params=params,
+                                )
+                                weights_active = _sanitize_weights(weights_active)
+                                weights_full = np.zeros(len(asset_list), dtype=float)
+                                for asset, weight in zip(active_assets, weights_active):
+                                    weights_full[asset_list.index(asset)] = weight
+                            except Exception as exc:
+                                # Track failures per combo to avoid spam
+                                failure_key = f"{combo_label}_{model_name}"
+                                if not hasattr(run_backtest, '_failures'):
+                                    run_backtest._failures = {}
 
-                        turnover = float(np.sum(np.abs(weights_full - prev_weights_full)))
-                        transaction_cost = turnover * cfg_bt.transaction_cost
+                                if failure_key not in run_backtest._failures:
+                                    run_backtest._failures[failure_key] = 0
+
+                                run_backtest._failures[failure_key] += 1
+
+                                # Only warn on first failure for each combo/model pair
+                                if run_backtest._failures[failure_key] == 1:
+                                    warnings.warn(
+                                        f"Optimization failed for model '{model_name}' combo '{combo_label}'. "
+                                        f"This warning will not repeat for this combination. "
+                                        f"Error: {exc}",
+                                        UserWarning,
+                                        stacklevel=2
+                                    )
+                                weights_full = prev_weights_full.copy()
+
+                            turnover = float(np.sum(np.abs(weights_full - prev_weights_full)))
+                            transaction_cost = turnover * cfg_bt.transaction_cost
 
                 for step_idx, period_ts in enumerate(period_index):
                     asset_returns = returns_subset.loc[period_ts, :].values
@@ -713,72 +762,87 @@ def _process_single_combo_model(args: Tuple) -> Optional[pd.DataFrame]:
             end_pos = rebalance_positions[pos_idx + 1] if pos_idx + 1 < len(rebalance_positions) else len(index_common)
             period_index = index_common[start_pos:end_pos]
 
-            if version_norm in ML_VERSION and forecast_selected:
-                mu_series, variance_series, skew_series, kurt_series, cvar_series = _prepare_moment_inputs(
-                    ts, asset_list, forecast_selected, baseline_selected
+            use_ml_weights = False
+            if version_norm in ML_VERSION and ml_weights_df is not None:
+                ml_weights = _extract_ml_weights(ml_weights_df, ts, asset_list)
+                if ml_weights is not None:
+                    weights_full = _sanitize_weights(ml_weights)
+                else:
+                    if prev_weights_full.sum() > 0:
+                        weights_full = prev_weights_full.copy()
+                    else:
+                        weights_full = np.full(len(asset_list), 1.0 / len(asset_list))
+                turnover = float(np.sum(np.abs(weights_full - prev_weights_full)))
+                transaction_cost = turnover * cfg_bt.transaction_cost
+                use_ml_weights = True
+
+            if not use_ml_weights:
+                if version_norm in ML_VERSION and forecast_selected:
+                    mu_series, variance_series, skew_series, kurt_series, cvar_series = _prepare_moment_inputs(
+                        ts, asset_list, forecast_selected, baseline_selected
+                    )
+                else:
+                    mu_series, variance_series, skew_series, kurt_series, cvar_series = _prepare_moment_inputs(
+                        ts, asset_list, baseline_selected, forecast_selected
+                    )
+
+                active_mask = (
+                    mu_series.notna()
+                    & variance_series.notna()
+                    & skew_series.notna()
+                    & kurt_series.notna()
+                    & cvar_series.notna()
                 )
-            else:
-                mu_series, variance_series, skew_series, kurt_series, cvar_series = _prepare_moment_inputs(
-                    ts, asset_list, baseline_selected, forecast_selected
-                )
 
-            active_mask = (
-                mu_series.notna()
-                & variance_series.notna()
-                & skew_series.notna()
-                & kurt_series.notna()
-                & cvar_series.notna()
-            )
-
-            active_assets = [asset for asset, flag in zip(asset_list, active_mask) if flag]
-            if not active_assets:
-                weights_full = prev_weights_full.copy()
-                turnover = 0.0
-                transaction_cost = 0.0
-            else:
-                window_slice = returns_subset.iloc[max(0, start_pos - cfg_bt.window + 1):start_pos + 1]
-                covariance_matrix = _ledoit_covariance(window_slice, active_assets)
-                if covariance_matrix is None:
-                    covariance_matrix = _diag_covariance(variance_series.loc[active_assets])
-
-                mu_vals = mu_series.loc[active_assets].values
-                skew_vals = skew_series.loc[active_assets].values
-                kurt_vals = kurt_series.loc[active_assets].values
-                cvar_vals = cvar_series.loc[active_assets].values
-
-                input_valid = True
-                if not (np.isfinite(mu_vals).all() and np.isfinite(skew_vals).all() and
-                        np.isfinite(kurt_vals).all() and np.isfinite(cvar_vals).all()):
-                    input_valid = False
-                if not np.isfinite(covariance_matrix).all():
-                    input_valid = False
-                if len(active_assets) < 2:
-                    input_valid = False
-
-                if not input_valid:
+                active_assets = [asset for asset, flag in zip(asset_list, active_mask) if flag]
+                if not active_assets:
                     weights_full = prev_weights_full.copy()
                     turnover = 0.0
                     transaction_cost = 0.0
                 else:
-                    try:
-                        weights_active = solve_portfolio(
-                            model_name=model_name,
-                            mu=mu_vals,
-                            sigma=covariance_matrix,
-                            skew=skew_vals,
-                            kurt=kurt_vals,
-                            cvar_series=cvar_vals,
-                            params=params,
-                        )
-                        weights_active = _sanitize_weights(weights_active)
-                        weights_full = np.zeros(len(asset_list), dtype=float)
-                        for asset, weight in zip(active_assets, weights_active):
-                            weights_full[asset_list.index(asset)] = weight
-                    except Exception:
-                        weights_full = prev_weights_full.copy()
+                    window_slice = returns_subset.iloc[max(0, start_pos - cfg_bt.window + 1):start_pos + 1]
+                    covariance_matrix = _ledoit_covariance(window_slice, active_assets)
+                    if covariance_matrix is None:
+                        covariance_matrix = _diag_covariance(variance_series.loc[active_assets])
 
-                    turnover = float(np.sum(np.abs(weights_full - prev_weights_full)))
-                    transaction_cost = turnover * cfg_bt.transaction_cost
+                    mu_vals = mu_series.loc[active_assets].values
+                    skew_vals = skew_series.loc[active_assets].values
+                    kurt_vals = kurt_series.loc[active_assets].values
+                    cvar_vals = cvar_series.loc[active_assets].values
+
+                    input_valid = True
+                    if not (np.isfinite(mu_vals).all() and np.isfinite(skew_vals).all() and
+                            np.isfinite(kurt_vals).all() and np.isfinite(cvar_vals).all()):
+                        input_valid = False
+                    if not np.isfinite(covariance_matrix).all():
+                        input_valid = False
+                    if len(active_assets) < 2:
+                        input_valid = False
+
+                    if not input_valid:
+                        weights_full = prev_weights_full.copy()
+                        turnover = 0.0
+                        transaction_cost = 0.0
+                    else:
+                        try:
+                            weights_active = solve_portfolio(
+                                model_name=model_name,
+                                mu=mu_vals,
+                                sigma=covariance_matrix,
+                                skew=skew_vals,
+                                kurt=kurt_vals,
+                                cvar_series=cvar_vals,
+                                params=params,
+                            )
+                            weights_active = _sanitize_weights(weights_active)
+                            weights_full = np.zeros(len(asset_list), dtype=float)
+                            for asset, weight in zip(active_assets, weights_active):
+                                weights_full[asset_list.index(asset)] = weight
+                        except Exception:
+                            weights_full = prev_weights_full.copy()
+
+                        turnover = float(np.sum(np.abs(weights_full - prev_weights_full)))
+                        transaction_cost = turnover * cfg_bt.transaction_cost
 
             for step_idx, period_ts in enumerate(period_index):
                 asset_returns = returns_subset.loc[period_ts, :].values
@@ -965,12 +1029,6 @@ if __name__ == "__main__":  # pragma: no cover - convenience entrypoint
     CONFIG = _load_config()
     freq_default = CONFIG.get("data", {}).get("frequencies", {}).get("daily", "1D")
     run_backtest(freq=freq_default, version="baseline", model_list=["MV"], combo_iterable=[])
-
-
-
-
-
-
 
 
 

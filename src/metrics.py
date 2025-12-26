@@ -12,7 +12,7 @@ import pandas as pd
 import yaml
 
 CVaR_ALPHA = 0.95
-ANNUALIZATION_FACTOR = 252
+ANNUALIZATION_FACTOR = 365
 
 
 def _load_params() -> Dict[str, dict]:

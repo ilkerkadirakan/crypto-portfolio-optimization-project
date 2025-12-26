@@ -50,14 +50,14 @@ def _annualize_stats(returns: pd.Series, freq: str) -> Tuple[float, float]:
 
     freq = freq.upper()
     if freq == "1D":
-        periods_per_year = 252
+        periods_per_year = 365
         mean = (1.0 + returns).prod() ** (periods_per_year / len(returns)) - 1.0
         vol = returns.std(ddof=1) * np.sqrt(periods_per_year)
         return mean, vol
 
     if freq == "1H":
         periods_per_day = 24
-        periods_per_year = periods_per_day * 252
+        periods_per_year = periods_per_day * 365
         compounded = (1.0 + returns).prod() ** (periods_per_year / len(returns)) - 1.0
         vol = returns.std(ddof=1) * np.sqrt(periods_per_year)
         return compounded, vol
@@ -100,7 +100,7 @@ def _rolling_sharpe(series: pd.Series, window: int = 60) -> pd.Series:
 
     rolling_mean = series.rolling(window=window, min_periods=window).mean()
     rolling_std = series.rolling(window=window, min_periods=window).std(ddof=1)
-    sharpe = (rolling_mean / rolling_std) * np.sqrt(252)
+    sharpe = (rolling_mean / rolling_std) * np.sqrt(365)
     return sharpe.replace([np.inf, -np.inf], np.nan)
 
 
