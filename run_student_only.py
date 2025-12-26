@@ -214,6 +214,10 @@ def run_student_only(
         use_ensemble = False
         model_types = ["xgb"]
         label = "XGBoost"
+    elif model_choice == "cat":
+        use_ensemble = False
+        model_types = ["cat"]
+        label = "CatBoost"
     else:
         use_ensemble = False
         model_types = ["lgb"]
@@ -490,7 +494,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--model",
-        choices=["xgb", "lgb", "ensemble"],
+        choices=["xgb", "lgb", "cat", "ensemble"],
         default="ensemble",
         help="Student model choice. Default: ensemble.",
     )

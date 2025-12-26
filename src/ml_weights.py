@@ -26,6 +26,12 @@ try:
 except ImportError:
     XGB_AVAILABLE = False
 
+try:
+    from catboost import CatBoostRegressor
+    CAT_AVAILABLE = True
+except ImportError:
+    CAT_AVAILABLE = False
+
 # Constants
 LAG_WINDOWS = 15  # Increased from 10 for more historical patterns
 TOP_K_ASSETS = {2, 3, 5}  # Valid portfolio sizes
@@ -347,9 +353,14 @@ def train_weight_models(
     available_models = ['lgb']
     if XGB_AVAILABLE:
         available_models.append('xgb')
+    if CAT_AVAILABLE:
+        available_models.append('cat')
     available_models.append('rf')
 
     model_types = [m for m in model_types if m in available_models]
+    if not model_types:
+        warnings.warn("[ML-Weights] No available ML models after filtering; aborting training.")
+        return
 
     multi_output_xgb = bool(
         use_multi_output_xgb
@@ -433,6 +444,15 @@ def train_weight_models(
                             verbosity=0,
                             n_jobs=xgb_n_jobs
                         )
+                    elif model_type == 'cat' and CAT_AVAILABLE:
+                        model = CatBoostRegressor(
+                            loss_function="RMSE",
+                            learning_rate=0.03,
+                            depth=8,
+                            n_estimators=500,
+                            random_seed=42,
+                            verbose=False
+                        )
                     elif model_type == 'rf':
                         model = RandomForestRegressor(
                             n_estimators=300,        # More trees
@@ -485,6 +505,15 @@ def train_weight_models(
                         random_state=42,
                         verbosity=0,
                         n_jobs=xgb_n_jobs
+                    )
+                elif model_type == 'cat' and CAT_AVAILABLE:
+                    model = CatBoostRegressor(
+                        loss_function="RMSE",
+                        learning_rate=0.1,
+                        depth=6,
+                        n_estimators=400,
+                        random_seed=42,
+                        verbose=False
                     )
                 elif model_type == 'rf':
                     model = RandomForestRegressor(
@@ -569,11 +598,13 @@ def train_weight_models(
 
                         # Improved ensemble weighting strategy
                         if model_type == 'xgb':
-                            weights.append(0.45)  # XGBoost generally best for structured data
+                            weights.append(0.40)  # XGBoost generally best for structured data
+                        elif model_type == 'cat':
+                            weights.append(0.30)  # CatBoost for robust patterns
                         elif model_type == 'lgb':
-                            weights.append(0.35)  # LightGBM second best
+                            weights.append(0.20)  # LightGBM second best
                         else:  # RandomForest
-                            weights.append(0.20)  # RF for diversity
+                            weights.append(0.10)  # RF for diversity
 
                     # Normalize weights
                     weights = np.array(weights)
