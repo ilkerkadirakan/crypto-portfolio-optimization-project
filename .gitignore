@@ -137,7 +137,7 @@ docker-compose.override.yml
 *.pid
 *.seed
 *.pid.lock
+catboost_info/
 
 # PyCharm
 .idea/
-

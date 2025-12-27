@@ -235,6 +235,7 @@ def _extract_ml_weights(
     ml_weights_df: pd.DataFrame | None,
     ts: pd.Timestamp,
     asset_list: Sequence[str],
+    combo_label: str | None = None,
 ) -> Optional[np.ndarray]:
     """
     Extract ML-predicted weights for a timestamp and align to the asset list.
@@ -243,7 +244,13 @@ def _extract_ml_weights(
         return None
 
     try:
-        row = _safe_loc(ml_weights_df, ts)
+        if combo_label and isinstance(ml_weights_df.index, pd.MultiIndex) and "combo" in ml_weights_df.index.names:
+            ts_key = pd.Timestamp(ts)
+            row = ml_weights_df.loc[(ts_key, combo_label)]
+            if isinstance(row, pd.DataFrame):
+                row = row.iloc[0]
+        else:
+            row = _safe_loc(ml_weights_df, ts)
     except Exception:
         return None
 
@@ -397,7 +404,17 @@ def _load_ml_weights(freq: str, processed_dir: Path) -> pd.DataFrame | None:
         return None
 
     ml_weights = pd.read_parquet(ml_weights_path)
-    ml_weights = _ensure_datetime_index(ml_weights)
+    if isinstance(ml_weights.index, pd.MultiIndex):
+        level0 = ml_weights.index.get_level_values(0)
+        if not isinstance(level0, pd.DatetimeIndex):
+            level0 = pd.to_datetime(level0)
+        level1 = ml_weights.index.get_level_values(1)
+        ml_weights.index = pd.MultiIndex.from_arrays([level0, level1], names=ml_weights.index.names)
+    elif not isinstance(ml_weights.index, pd.DatetimeIndex):
+        ml_weights = _ensure_datetime_index(ml_weights)
+
+    if "combo" in ml_weights.columns:
+        ml_weights = ml_weights.set_index("combo", append=True).sort_index()
     return ml_weights
 
 
@@ -540,7 +557,7 @@ def run_backtest(
 
                 use_ml_weights = False
                 if version_norm in ML_VERSION and ml_weights_df is not None:
-                    ml_weights = _extract_ml_weights(ml_weights_df, ts, asset_list)
+                    ml_weights = _extract_ml_weights(ml_weights_df, ts, asset_list, combo_label)
                     if ml_weights is not None:
                         weights_full = _sanitize_weights(ml_weights)
                     else:
@@ -764,7 +781,7 @@ def _process_single_combo_model(args: Tuple) -> Optional[pd.DataFrame]:
 
             use_ml_weights = False
             if version_norm in ML_VERSION and ml_weights_df is not None:
-                ml_weights = _extract_ml_weights(ml_weights_df, ts, asset_list)
+                ml_weights = _extract_ml_weights(ml_weights_df, ts, asset_list, combo_label)
                 if ml_weights is not None:
                     weights_full = _sanitize_weights(ml_weights)
                 else:
@@ -1029,7 +1046,5 @@ if __name__ == "__main__":  # pragma: no cover - convenience entrypoint
     CONFIG = _load_config()
     freq_default = CONFIG.get("data", {}).get("frequencies", {}).get("daily", "1D")
     run_backtest(freq=freq_default, version="baseline", model_list=["MV"], combo_iterable=[])
-
-
 
 

@@ -308,14 +308,21 @@ def train_weight_models(
 
     print(f"[ML-Weights] Features shape: {features_df.shape}")
 
-    # Merge features with teacher weights (now only one combo/model per timestamp)
-    merged_df = features_df.join(teacher_weights_best.set_index('timestamp')[weight_cols], how='inner')
+    # Merge features with teacher weights (may include multiple combos per timestamp)
+    merged_df = features_df.join(teacher_weights_best.set_index('timestamp'), how='inner')
 
     if merged_df.empty:
         warnings.warn("[ML-Weights] No overlapping timestamps between features and teacher weights")
         return
 
     print(f"[ML-Weights] Training data shape: {merged_df.shape}")
+
+    # Add combo indicator features so the model is combo-conditional
+    combo_series = merged_df.get('combo')
+    if combo_series is not None:
+        combo_tokens = combo_series.astype(str).str.split("_")
+        for asset in asset_list:
+            merged_df[f"combo_has_{asset}"] = combo_tokens.apply(lambda items: 1.0 if asset in items else 0.0)
 
     # Split features and targets
     X = merged_df.drop(columns=weight_cols + ['combo', 'model'], errors='ignore').fillna(0)
@@ -623,16 +630,19 @@ def train_weight_models(
                 warnings.warn(f"[ML-Weights] Failed to predict for {asset_name}: {exc}")
 
     pred_df = pd.DataFrame(predictions, index=X.index)
+    if combo_series is not None:
+        pred_df["combo"] = combo_series.values
 
     softmax_temp = float(softmax_temp)
     if softmax_temp != 1.0 and softmax_temp > 0:
-        pred_vals = pred_df.to_numpy(dtype=float)
+        weight_cols_pred = [c for c in pred_df.columns if c.startswith("pred_weight_")]
+        pred_vals = pred_df[weight_cols_pred].to_numpy(dtype=float)
         pred_vals = pred_vals / softmax_temp
         pred_vals = pred_vals - np.max(pred_vals, axis=1, keepdims=True)
         exp_vals = np.exp(pred_vals)
         denom = np.sum(exp_vals, axis=1, keepdims=True)
         denom[denom == 0] = 1.0
-        pred_df = pd.DataFrame(exp_vals / denom, index=pred_df.index, columns=pred_df.columns)
+        pred_df.loc[:, weight_cols_pred] = exp_vals / denom
 
     # Save predictions
     pred_path = processed_dir / f"ml_predicted_weights_{freq.lower()}.parquet"
