@@ -310,6 +310,8 @@ def train_weight_models(
 
     # Merge features with teacher weights (may include multiple combos per timestamp)
     merged_df = features_df.join(teacher_weights_best.set_index('timestamp'), how='inner')
+    if "timestamp" not in merged_df.columns:
+        merged_df = merged_df.reset_index().rename(columns={'index': 'timestamp'})
 
     if merged_df.empty:
         warnings.warn("[ML-Weights] No overlapping timestamps between features and teacher weights")

@@ -160,6 +160,7 @@ def run_student_only(
     noise_samples=0,
     xgb_multi_output=False,
     softmax_temp=1.0,
+    oos_split=0.0,
 ):
     """
     Train and evaluate Student models using pre-computed Teacher results.
@@ -448,6 +449,82 @@ def run_student_only(
     _archive_file(student_ranking_path, attempts_dir, attempt_suffix)
     _archive_file(winner_path, attempts_dir, attempt_suffix)
 
+    # Optional holdout (OOS) evaluation on the tail of the sample
+    if oos_split and 0 < float(oos_split) < 1:
+        split_ratio = float(oos_split)
+        student_results = student_results.copy()
+        student_results["timestamp"] = pd.to_datetime(student_results["timestamp"])
+        teacher_results_local = teacher_results.copy()
+        teacher_results_local["timestamp"] = pd.to_datetime(teacher_results_local["timestamp"])
+
+        unique_ts = pd.Index(student_results["timestamp"]).unique().sort_values()
+        cutoff_idx = max(1, int(len(unique_ts) * (1 - split_ratio)))
+        cutoff_ts = unique_ts[cutoff_idx - 1]
+
+        oos_student = student_results[student_results["timestamp"] > cutoff_ts]
+        oos_teacher = teacher_results_local[teacher_results_local["timestamp"] > cutoff_ts]
+
+        if not oos_student.empty:
+            oos_grouped = oos_student.groupby(['combo', 'model'])['net_return'].agg(['mean', 'std', 'count'])
+            daily_sharpe = oos_grouped['mean'] / (oos_grouped['std'] + 1e-10)
+            oos_grouped['sharpe'] = daily_sharpe * np.sqrt(365)
+            oos_grouped['annualized_return'] = oos_grouped['mean'] * 365
+            oos_grouped['volatility'] = oos_grouped['std'] * np.sqrt(365)
+            oos_ranking = oos_grouped.sort_values('sharpe', ascending=False).reset_index()
+
+            oos_ranking_path = pipeline_results_dir / f"student_ranking_oos_{freq.lower()}.csv"
+            oos_ranking.to_csv(oos_ranking_path, index=False)
+            print(f"[Student] Saved OOS ranking to {oos_ranking_path}")
+
+            oos_winner = oos_ranking.iloc[0]
+            oos_winner_data = {
+                'freq': freq,
+                'combo': oos_winner['combo'],
+                'model': oos_winner['model'],
+                'sharpe': float(oos_winner['sharpe']),
+                'annualized_return': float(oos_winner['annualized_return']),
+                'volatility': float(oos_winner['volatility']),
+                'version': 'student',
+                'cutoff': str(cutoff_ts),
+                'oos_split': split_ratio,
+            }
+            oos_winner_path = pipeline_results_dir / f"winner_student_oos_{freq.lower()}.json"
+            with open(oos_winner_path, 'w') as f:
+                json.dump(oos_winner_data, f, indent=2)
+            print(f"[Student] Saved OOS winner to {oos_winner_path}")
+
+            teacher_grouped = oos_teacher.groupby(['combo', 'model'])['net_return'].agg(['mean', 'std', 'count'])
+            daily_sharpe = teacher_grouped['mean'] / (teacher_grouped['std'] + 1e-10)
+            teacher_grouped['sharpe'] = daily_sharpe * np.sqrt(365)
+            teacher_grouped['annualized_return'] = teacher_grouped['mean'] * 365
+            teacher_grouped['volatility'] = teacher_grouped['std'] * np.sqrt(365)
+            teacher_ranking = teacher_grouped.sort_values('sharpe', ascending=False).reset_index()
+            teacher_oos_winner = teacher_ranking.iloc[0]
+
+            comparison_oos = {
+                'freq': freq,
+                'cutoff': str(cutoff_ts),
+                'oos_split': split_ratio,
+                'teacher': {
+                    'combo': teacher_oos_winner['combo'],
+                    'model': teacher_oos_winner['model'],
+                    'sharpe': float(teacher_oos_winner['sharpe']),
+                    'annualized_return': float(teacher_oos_winner['annualized_return']),
+                    'volatility': float(teacher_oos_winner['volatility']),
+                },
+                'student': {
+                    'combo': oos_winner['combo'],
+                    'model': oos_winner['model'],
+                    'sharpe': float(oos_winner['sharpe']),
+                    'annualized_return': float(oos_winner['annualized_return']),
+                    'volatility': float(oos_winner['volatility']),
+                },
+            }
+            comparison_oos_path = pipeline_results_dir / f"teacher_vs_student_oos_{freq.lower()}.json"
+            with open(comparison_oos_path, 'w') as f:
+                json.dump(comparison_oos, f, indent=2)
+            print(f"[Student] Saved OOS comparison to {comparison_oos_path}")
+
     # STEP 4: Compare Teacher vs Student
     print("\n" + "="*80)
     print("TEACHER vs STUDENT COMPARISON")
@@ -567,6 +644,12 @@ if __name__ == "__main__":
         default=1.0,
         help="Softmax temperature for predicted weights (higher = more uniform).",
     )
+    parser.add_argument(
+        "--oos-split",
+        type=float,
+        default=0.0,
+        help="Holdout split ratio for OOS evaluation (e.g. 0.3 uses last 30%).",
+    )
     args = parser.parse_args()
 
     for freq in args.freqs:
@@ -589,4 +672,5 @@ if __name__ == "__main__":
             noise_samples=args.noise_samples,
             xgb_multi_output=args.xgb_multi_output,
             softmax_temp=args.softmax_temp,
+            oos_split=args.oos_split,
         )
