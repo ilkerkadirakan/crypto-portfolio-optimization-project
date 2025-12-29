@@ -450,6 +450,8 @@ def run_backtest(
     version: str,
     model_list: Sequence[str],
     combo_iterable: Iterable[Union[str, int, Tuple, List, Dict[str, object]]],
+    start_ts: pd.Timestamp | None = None,
+    end_ts: pd.Timestamp | None = None,
 ) -> pd.DataFrame:
     """
     Execute rolling portfolio backtests for the specified models and combinations.
@@ -508,6 +510,19 @@ def run_backtest(
     rebalance_positions = _rebalance_positions(index_common, cfg_bt)
     if not rebalance_positions:
         raise ValueError("No rebalance positions were generated; check window and data alignment.")
+
+    if start_ts is not None or end_ts is not None:
+        start_ts = pd.Timestamp(start_ts) if start_ts is not None else None
+        end_ts = pd.Timestamp(end_ts) if end_ts is not None else None
+        filtered_positions = []
+        for pos in rebalance_positions:
+            ts = index_common[pos]
+            if start_ts is not None and ts < start_ts:
+                continue
+            if end_ts is not None and ts > end_ts:
+                continue
+            filtered_positions.append(pos)
+        rebalance_positions = filtered_positions
 
     all_runs: List[pd.DataFrame] = []
     project_root = Path(__file__).resolve().parents[1]
@@ -919,6 +934,8 @@ def run_backtest_parallel(
     model_list: Sequence[str],
     combo_iterable: Iterable[Union[str, int, Tuple, List, Dict[str, object]]],
     n_jobs: int = -1,
+    start_ts: pd.Timestamp | None = None,
+    end_ts: pd.Timestamp | None = None,
 ) -> pd.DataFrame:
     """
     Execute rolling portfolio backtests using parallel processing.
@@ -980,6 +997,14 @@ def run_backtest_parallel(
     rebalance_positions = _rebalance_positions(index_common, cfg_bt)
     if not rebalance_positions:
         raise ValueError("No rebalance positions were generated; check window and data alignment.")
+    if start_ts is not None or end_ts is not None:
+        start_ts = pd.Timestamp(start_ts) if start_ts is not None else None
+        end_ts = pd.Timestamp(end_ts) if end_ts is not None else None
+        rebalance_positions = [
+            pos for pos in rebalance_positions
+            if (start_ts is None or index_common[pos] >= start_ts)
+            and (end_ts is None or index_common[pos] <= end_ts)
+        ]
 
     project_root = Path(__file__).resolve().parents[1]
     results_root = project_root / "results" / "runs"
@@ -1046,5 +1071,3 @@ if __name__ == "__main__":  # pragma: no cover - convenience entrypoint
     CONFIG = _load_config()
     freq_default = CONFIG.get("data", {}).get("frequencies", {}).get("daily", "1D")
     run_backtest(freq=freq_default, version="baseline", model_list=["MV"], combo_iterable=[])
-
-

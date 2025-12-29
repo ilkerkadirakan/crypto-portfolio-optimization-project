@@ -145,6 +145,175 @@ def _get_completed_combos(checkpoint_df: pd.DataFrame) -> set:
     return completed
 
 
+def _get_rebalance_timestamps(freq: str, processed_dir: Path) -> list[pd.Timestamp]:
+    cfg = backtest_engine._load_config()
+    cfg_bt = backtest_engine._get_backtest_config(cfg, freq)
+    returns_df = backtest_engine._load_returns(freq, processed_dir).sort_index()
+    baseline_panels, _ = backtest_engine._load_moments(freq, processed_dir, "ml")
+    first_valid = baseline_panels.get("mean").dropna(how="all").index[0]
+    index_common = returns_df.loc[first_valid:].index
+    positions = backtest_engine._rebalance_positions(index_common, cfg_bt)
+    return [index_common[pos] for pos in positions]
+
+
+def _run_student_walk_forward(
+    teacher_results: pd.DataFrame,
+    combos: list,
+    freq: str,
+    processed_dir: Path,
+    pipeline_results_dir: Path,
+    model_list: list[str],
+    use_ensemble: bool,
+    model_types: list,
+    label: str,
+    top_k_teachers: int,
+    same_asset_count: bool,
+    n_lags: int,
+    noise_std: float,
+    noise_samples: int,
+    xgb_multi_output: bool,
+    softmax_temp: float,
+    wf_train_windows: int,
+    wf_test_windows: int,
+    wf_max_folds: int | None,
+) -> None:
+    timestamps = _get_rebalance_timestamps(freq, processed_dir)
+    if len(timestamps) < wf_train_windows + wf_test_windows:
+        print("[Student] Not enough rebalance windows for walk-forward")
+        return
+
+    folds = list(range(wf_train_windows, len(timestamps) - wf_test_windows + 1))
+    if wf_max_folds:
+        folds = folds[-wf_max_folds:]
+
+    wf_results = []
+    for fold_idx, i in enumerate(folds, 1):
+        train_start = timestamps[i - wf_train_windows]
+        train_end = timestamps[i - 1]
+        test_start = timestamps[i]
+        test_end = timestamps[i + wf_test_windows - 1]
+
+        print(f"\n[WF] Fold {fold_idx}/{len(folds)} train={train_start.date()}..{train_end.date()} "
+              f"test={test_start.date()}..{test_end.date()}")
+
+        train_subset = teacher_results[
+            (teacher_results["timestamp"] >= train_start)
+            & (teacher_results["timestamp"] <= train_end)
+        ]
+        if train_subset.empty:
+            print("[WF] Skipping fold: no teacher data")
+            continue
+
+        ml_weights.train_weight_models(
+            teacher_results=train_subset,
+            processed_dir=processed_dir,
+            freq=freq,
+            use_ensemble=use_ensemble,
+            model_types=model_types,
+            use_multi_output_xgb=xgb_multi_output,
+            softmax_temp=softmax_temp,
+            top_k_teachers=top_k_teachers,
+            same_asset_count=same_asset_count,
+            n_lags=n_lags,
+            noise_std=noise_std,
+            noise_samples=noise_samples,
+        )
+
+        fold_results = backtest_engine.run_backtest_parallel(
+            freq=freq,
+            version="ml",
+            model_list=model_list,
+            combo_iterable=combos,
+            n_jobs=-1,
+            start_ts=test_start,
+            end_ts=test_end,
+        )
+        if fold_results.empty:
+            continue
+        fold_results = fold_results.assign(
+            wf_fold=fold_idx,
+            wf_train_start=train_start,
+            wf_train_end=train_end,
+            wf_test_start=test_start,
+            wf_test_end=test_end,
+        )
+        wf_results.append(fold_results)
+
+    if not wf_results:
+        print("[WF] No results generated")
+        return
+
+    student_results = pd.concat(wf_results, ignore_index=True)
+    student_path = pipeline_results_dir / f"student_wf_{freq.lower()}.parquet"
+    print(f"[WF] Saving {len(student_results)} results to {student_path}")
+    _save_large_parquet(student_results, student_path)
+
+    grouped = student_results.groupby(['combo', 'model'])['net_return'].agg(['mean', 'std', 'count'])
+    daily_sharpe = grouped['mean'] / (grouped['std'] + 1e-10)
+    grouped['sharpe'] = daily_sharpe * np.sqrt(365)
+    grouped['annualized_return'] = grouped['mean'] * 365
+    grouped['volatility'] = grouped['std'] * np.sqrt(365)
+
+    ranking = grouped.sort_values('sharpe', ascending=False).reset_index()
+    ranking_path = pipeline_results_dir / f"student_ranking_wf_{freq.lower()}.csv"
+    ranking.to_csv(ranking_path, index=False)
+    print(f"[WF] Saved ranking to {ranking_path}")
+
+    winner = ranking.iloc[0]
+    winner_data = {
+        'freq': freq,
+        'combo': winner['combo'],
+        'model': winner['model'],
+        'sharpe': float(winner['sharpe']),
+        'annualized_return': float(winner['annualized_return']),
+        'volatility': float(winner['volatility']),
+        'version': 'student',
+        'walk_forward': True,
+        'train_windows': wf_train_windows,
+        'test_windows': wf_test_windows,
+        'folds': len(folds),
+    }
+    winner_path = pipeline_results_dir / f"winner_student_wf_{freq.lower()}.json"
+    with open(winner_path, 'w') as f:
+        json.dump(winner_data, f, indent=2)
+    print(f"[WF] Saved winner to {winner_path}")
+
+    teacher_results = teacher_results.copy()
+    teacher_results["timestamp"] = pd.to_datetime(teacher_results["timestamp"])
+    oos_ts = student_results["timestamp"].unique()
+    teacher_oos = teacher_results[teacher_results["timestamp"].isin(oos_ts)]
+    teacher_grouped = teacher_oos.groupby(['combo', 'model'])['net_return'].agg(['mean', 'std', 'count'])
+    daily_sharpe = teacher_grouped['mean'] / (teacher_grouped['std'] + 1e-10)
+    teacher_grouped['sharpe'] = daily_sharpe * np.sqrt(365)
+    teacher_grouped['annualized_return'] = teacher_grouped['mean'] * 365
+    teacher_grouped['volatility'] = teacher_grouped['std'] * np.sqrt(365)
+    teacher_ranking = teacher_grouped.sort_values('sharpe', ascending=False).reset_index()
+    teacher_winner = teacher_ranking.iloc[0]
+
+    comparison = {
+        'freq': freq,
+        'walk_forward': True,
+        'teacher': {
+            'combo': teacher_winner['combo'],
+            'model': teacher_winner['model'],
+            'sharpe': float(teacher_winner['sharpe']),
+            'annualized_return': float(teacher_winner['annualized_return']),
+            'volatility': float(teacher_winner['volatility']),
+        },
+        'student': {
+            'combo': winner['combo'],
+            'model': winner['model'],
+            'sharpe': float(winner['sharpe']),
+            'annualized_return': float(winner['annualized_return']),
+            'volatility': float(winner['volatility']),
+        },
+    }
+    comparison_path = pipeline_results_dir / f"teacher_vs_student_wf_{freq.lower()}.json"
+    with open(comparison_path, 'w') as f:
+        json.dump(comparison, f, indent=2)
+    print(f"[WF] Saved comparison to {comparison_path}")
+
+
 def run_student_only(
     freq="1D",
     checkpoint_batch_size=500,
@@ -161,6 +330,10 @@ def run_student_only(
     xgb_multi_output=False,
     softmax_temp=1.0,
     oos_split=0.0,
+    walk_forward=False,
+    wf_train_windows=None,
+    wf_test_windows=None,
+    wf_max_folds=None,
 ):
     """
     Train and evaluate Student models using pre-computed Teacher results.
@@ -185,6 +358,8 @@ def run_student_only(
     print(f"[Student-Only] Loading teacher results from {teacher_path}")
     teacher_results = pd.read_parquet(teacher_path)
     print(f"[Student-Only] Loaded {len(teacher_results)} teacher backtest rows")
+    teacher_results = teacher_results.copy()
+    teacher_results["timestamp"] = pd.to_datetime(teacher_results["timestamp"])
 
     # Load combinations
     combos_by_size = combination_utils.cache_combinations()
@@ -200,11 +375,6 @@ def run_student_only(
         combos = combos[:max(combo_limit, 0)]
 
     print(f"[Student-Only] Found {len(combos)} portfolio combinations")
-
-    # STEP 1: Train Student ML models
-    print("\n" + "="*80)
-    print("TRAINING STUDENT (ML Weight Learning)")
-    print("="*80)
 
     from src import ml_weights
     if model_choice == "ensemble":
@@ -223,6 +393,39 @@ def run_student_only(
         use_ensemble = False
         model_types = ["lgb"]
         label = "LightGBM"
+
+    if walk_forward:
+        cfg = backtest_engine._load_config()
+        wf_cfg = cfg.get("ml", {}).get("walk_forward", {})
+        wf_train_windows = wf_train_windows or int(wf_cfg.get("train_windows", 60))
+        wf_test_windows = wf_test_windows or int(wf_cfg.get("test_windows", 1))
+        _run_student_walk_forward(
+            teacher_results=teacher_results,
+            combos=combos,
+            freq=freq,
+            processed_dir=processed_dir,
+            pipeline_results_dir=pipeline_results_dir,
+            model_list=model_list or ["MV", "MVSK", "MCVaRSK"],
+            use_ensemble=use_ensemble,
+            model_types=model_types,
+            label=label,
+            top_k_teachers=top_k_teachers,
+            same_asset_count=same_asset_count,
+            n_lags=n_lags,
+            noise_std=noise_std,
+            noise_samples=noise_samples,
+            xgb_multi_output=xgb_multi_output,
+            softmax_temp=softmax_temp,
+            wf_train_windows=wf_train_windows,
+            wf_test_windows=wf_test_windows,
+            wf_max_folds=wf_max_folds,
+        )
+        return
+
+    # STEP 1: Train Student ML models
+    print("\n" + "="*80)
+    print("TRAINING STUDENT (ML Weight Learning)")
+    print("="*80)
 
     print(f"[Student] Training ML {label} models to learn portfolio weights...")
     ml_weights.train_weight_models(
@@ -650,6 +853,29 @@ if __name__ == "__main__":
         default=0.0,
         help="Holdout split ratio for OOS evaluation (e.g. 0.3 uses last 30%).",
     )
+    parser.add_argument(
+        "--walk-forward",
+        action="store_true",
+        help="Enable walk-forward evaluation over rebalance windows.",
+    )
+    parser.add_argument(
+        "--wf-train-windows",
+        type=int,
+        default=None,
+        help="Walk-forward train window count (rebalance steps).",
+    )
+    parser.add_argument(
+        "--wf-test-windows",
+        type=int,
+        default=None,
+        help="Walk-forward test window count (rebalance steps).",
+    )
+    parser.add_argument(
+        "--wf-max-folds",
+        type=int,
+        default=None,
+        help="Limit number of walk-forward folds (use last N).",
+    )
     args = parser.parse_args()
 
     for freq in args.freqs:
@@ -673,4 +899,8 @@ if __name__ == "__main__":
             xgb_multi_output=args.xgb_multi_output,
             softmax_temp=args.softmax_temp,
             oos_split=args.oos_split,
+            walk_forward=args.walk_forward,
+            wf_train_windows=args.wf_train_windows,
+            wf_test_windows=args.wf_test_windows,
+            wf_max_folds=args.wf_max_folds,
         )
