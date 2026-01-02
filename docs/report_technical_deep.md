@@ -170,3 +170,6 @@ Teacher (1D, MVSK):
 
 ## 11. Kapanış
 Bu proje, MVSK tabanlı klasik optimizasyon ile denetimli öğrenmenin birlikte kullanılabileceğini ve combo-conditional ağırlık tahmininin daha gerçekçi sonuçlar ürettiğini göstermiştir. In-sample ve OOS sonuçları umut verici olmakla birlikte, daha kapsamlı genelleme testleri (walk-forward) önerilmektedir.
+
+## Ek: Kazanan Portföy Ağırlıkları
+- Ayrıntılı ağırlık tabloları: `docs/weights_summary.md`
