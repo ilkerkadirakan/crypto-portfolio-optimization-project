@@ -138,6 +138,9 @@ Teacher (1D, MVSK):
 - PGP ayrı bir modelleme paradigmasıdır; goal-deviation minimizasyonu ister.
 - Projenin önceliği teacher-student ML yaklaşımını tamamlamak olduğu için PGP bu sürümde uygulanmadı.
 - PGP ileride eklenebilir (geliştirme önerisi).
+ - Teknik zorluk: PGP’de hedef sapmaları için uygun ölçekleme ve hedef seviyeleri gerekir; bu seviyeler yüksek momentler (skew/kurt) için stabil kalibrasyon ister.
+ - Ek olarak PGP, mevcut MVSK çözümünden farklı bir amaç fonksiyonu kurar; bu da öğretmen-öğrenci boru hattını yeniden hizalamayı gerektirir.
+ - Zaman kısıtı altında, PGP’nin sağlam parametrizasyonu ve doğrulaması ayrı bir çalışma alanı olduğundan bu sürümde kapsam dışı bırakılmıştır.
 
 ---
 
