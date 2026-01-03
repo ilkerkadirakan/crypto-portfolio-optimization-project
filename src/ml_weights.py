@@ -327,7 +327,7 @@ def train_weight_models(
             merged_df[f"combo_has_{asset}"] = combo_tokens.apply(lambda items: 1.0 if asset in items else 0.0)
 
     # Split features and targets
-    X = merged_df.drop(columns=weight_cols + ['combo', 'model'], errors='ignore').fillna(0)
+    X = merged_df.drop(columns=weight_cols + ['combo', 'model', 'timestamp'], errors='ignore').fillna(0)
     y = merged_df[weight_cols].fillna(0)
 
     # Optional noise augmentation to reduce overfitting to exact teacher weights

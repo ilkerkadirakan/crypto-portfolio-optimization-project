@@ -126,6 +126,18 @@ def _archive_file(src: Path, dest_dir: Path, stem_suffix: str) -> None:
     dest.write_bytes(src.read_bytes())
 
 
+def _combo_to_str(combo) -> str:
+    """Normalize combo representations into the backtest label format."""
+    if isinstance(combo, dict):
+        for key in ("name", "label", "id"):
+            if key in combo and combo[key]:
+                return str(combo[key])
+        return "_".join(f"{k}-{v}" for k, v in sorted(combo.items()))
+    if isinstance(combo, (list, tuple)):
+        return "_".join(str(item) for item in combo)
+    return str(combo)
+
+
 def _get_completed_combos(checkpoint_df: pd.DataFrame) -> set:
     """Extract completed combo+model pairs from checkpoint."""
     if checkpoint_df.empty:
@@ -329,6 +341,7 @@ def run_student_only(
     noise_samples=0,
     xgb_multi_output=False,
     softmax_temp=1.0,
+    limit_to_predicted_combos=False,
     oos_split=0.0,
     walk_forward=False,
     wf_train_windows=None,
@@ -455,6 +468,16 @@ def run_student_only(
     _archive_file(ml_model_path, attempts_dir, attempt_suffix)
     print(f"[Student] Archived ML artifacts with id={attempt_suffix}")
 
+    if limit_to_predicted_combos:
+        if not ml_pred_path.exists():
+            raise FileNotFoundError(f"ML predictions not found at {ml_pred_path}")
+        pred_df = pd.read_parquet(ml_pred_path, columns=["combo"])
+        predicted_combos = set(pred_df["combo"].dropna().unique())
+        if not predicted_combos:
+            raise ValueError("ML predictions contain no combos; cannot limit student run.")
+        combos = [c for c in combos if _combo_to_str(c) in predicted_combos]
+        print(f"[Student] Limiting to ML-predicted combos: {len(combos)}")
+
     # STEP 2: Run Student backtest
     print("\n" + "="*80)
     print("BACKTESTING STUDENT PORTFOLIOS")
@@ -483,19 +506,7 @@ def run_student_only(
     debug_count = 0
     for combo in combos:
         # Combo formatını normalize et (backtest_engine._combo_label ile aynı formatta)
-        if isinstance(combo, dict):
-            # Dict formatı için
-            for key in ("name", "label", "id"):
-                if key in combo and combo[key]:
-                    combo_str = str(combo[key])
-                    break
-            else:
-                combo_str = "_".join(f"{k}-{v}" for k, v in sorted(combo.items()))
-        elif isinstance(combo, (list, tuple)):
-            # List/tuple için string'e çevir
-            combo_str = "_".join(str(item) for item in combo)
-        else:
-            combo_str = str(combo)
+        combo_str = _combo_to_str(combo)
 
         # Her model için kontrol et - model adlarını normalize et
         models_needed = [m for m in model_list if (combo_str, m.upper()) not in completed_combos]
@@ -848,6 +859,11 @@ if __name__ == "__main__":
         help="Softmax temperature for predicted weights (higher = more uniform).",
     )
     parser.add_argument(
+        "--limit-ml-combos",
+        action="store_true",
+        help="Restrict student backtest to combos with ML predictions.",
+    )
+    parser.add_argument(
         "--oos-split",
         type=float,
         default=0.0,
@@ -898,6 +914,7 @@ if __name__ == "__main__":
             noise_samples=args.noise_samples,
             xgb_multi_output=args.xgb_multi_output,
             softmax_temp=args.softmax_temp,
+            limit_to_predicted_combos=args.limit_ml_combos,
             oos_split=args.oos_split,
             walk_forward=args.walk_forward,
             wf_train_windows=args.wf_train_windows,

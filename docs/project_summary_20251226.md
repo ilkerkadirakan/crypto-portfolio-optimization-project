@@ -57,7 +57,34 @@ Develop a crypto portfolio strategy using MVSK-based optimization and supervised
     - Annual Return: 137.30%
     - Volatility: 64.80%
 
-5) Softmax temp=0.7 (full run)
+5) Combo-conditional XGB (full run, OOS split 0.25)
+- OOS (last 25%) comparison:
+  - Student: AAVEBTC_DOGEBTC_XRPBTC (MVSK)
+    - Sharpe: 3.0994
+    - Annual Return: 156.69%
+    - Volatility: 50.56%
+    - Note: OOS döneminde ağırlıklar 1/3-1/3-1/3 sabit kaldı (rebalance boyunca değişmedi).
+  - Teacher: AAVEBTC_XRPBTC (MCVARSK)
+    - Sharpe: 2.9262
+    - Annual Return: 195.12%
+    - Volatility: 66.68%
+    - Note: OOS döneminde ağırlıklar ~0.50/0.50 sabit kaldı (çok düşük varyans).
+
+6) ML-only combos (limit-ml-combos, top-300 teacher train set)
+- ML tahmini olan combo sayısı: 212 (tüm 16,834 yerine).
+- In-sample student winner:
+  - Combo: BCHBTC_DOGEBTC_SOLBTC_STXBTC_XRPBTC
+  - Sharpe: 0.6441
+  - Annual Return: 26.92%
+  - Volatility: 41.79%
+- OOS (%25) student winner:
+  - Combo: AAVEBTC_BNBBTC_LTCBTC_SOLBTC_XRPBTC
+  - Sharpe: 1.7069
+  - Annual Return: 70.20%
+  - Volatility: 41.13%
+- Not: Önceki yüksek OOS skorların bir kısmı ML olmayan fallback optimizasyondan geliyordu. Bu koşu tamamen ML tahmini olan combo’larla sınırlıdır.
+
+7) Softmax temp=0.7 (full run)
 - In-sample dropped to Sharpe 0.7922.
 - OOS winner unchanged; OOS Sharpe still ~2.1237.
 
@@ -78,9 +105,11 @@ Develop a crypto portfolio strategy using MVSK-based optimization and supervised
 - OOS student ranking: results/pipeline/student_ranking_oos_1d.csv
 - OOS student winner: results/pipeline/winner_student_oos_1d.json
 - OOS comparison: results/pipeline/teacher_vs_student_oos_1d.json
+- OOS 0.30 backup: results/runs/oos_0_30_backup
 
 ## Limitations
 - OOS stability not fully validated (split sensitivity high).
+- OOS %25 döneminde Student ve Teacher ağırlıkları düşük varyans gösterdi; sinyal zayıflığı veya dönemsel simetri olasılığı var.
 - PGP not implemented (mentioned in proposal but not required for current runs).
 - Walk-forward validation not completed due to runtime.
 

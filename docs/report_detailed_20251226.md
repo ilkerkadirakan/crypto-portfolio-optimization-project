@@ -86,12 +86,45 @@ Cutoff: 2024-04-02
 - Annual Return: 137.30%
 - Volatility: 64.80%
 
+### 8.3. OOS (Holdout %25)
+Cutoff: 2024-05-17
+
+**Student OOS Winner**
+- Combo: AAVEBTC_DOGEBTC_XRPBTC
+- Sharpe: 3.0994
+- Annual Return: 156.69%
+- Volatility: 50.56%
+ - Not: OOS %25 döneminde ağırlıklar 1/3-1/3-1/3 sabit kaldı (rebalance boyunca değişmedi).
+
+**Teacher OOS Winner**
+- Combo: AAVEBTC_XRPBTC
+- Sharpe: 2.9262
+- Annual Return: 195.12%
+- Volatility: 66.68%
+ - Not: OOS %25 döneminde ağırlıklar ~0.50/0.50 sabit kaldı (çok düşük varyans).
+
+### 8.4. ML-Only Kombolar (limit-ml-combos)
+- ML tahmini olan combo sayısı: 212.
+- In-sample Student winner:
+  - Combo: BCHBTC_DOGEBTC_SOLBTC_STXBTC_XRPBTC
+  - Sharpe: 0.6441
+  - Annual Return: 26.92%
+  - Volatility: 41.79%
+- OOS (%25) Student winner:
+  - Combo: AAVEBTC_BNBBTC_LTCBTC_SOLBTC_XRPBTC
+  - Sharpe: 1.7069
+  - Annual Return: 70.20%
+  - Volatility: 41.13%
+- Not: Bu koşu yalnızca ML tahmini olan combo’ları içerdiği için fallback optimizasyon etkisi yoktur.
+
 Sonuçlar, Student’ın Sharpe açısından hafif üstün olduğunu, Teacher’ın ise daha yüksek getiri ürettiğini göstermektedir.
 
 ## 9. Değerlendirme
 - Combo-conditional ML yaklaşımı, aynı ağırlıkların tüm kombinasyonlara uygulanması hatasını çözdü.
 - Multi-output XGBoost, MVSK optimizasyonunu taklit edebilir ve bazı durumlarda Sharpe artışı sağlar.
-- OOS %30 split sonuçları, Student’ın risk-getiri dengesinde avantaj sağlayabileceğini göstermektedir.
+- OOS %30 ve %25 split sonuçları, Student’ın risk-getiri dengesinde avantaj sağlayabileceğini göstermektedir.
+- OOS %25’te ağırlıkların sabit kalması, dönemdeki sinyal zayıflığı veya modelin düşük varyasyon üretmesiyle ilişkilendirilebilir.
+- ML-only koşusunda Student performansı daha düşük bulunmuştur; bu, önceki OOS sonuçlarının kısmen fallback optimizasyon kaynaklı olabileceğini göstermektedir.
 
 ## 10. Geliştirme Önerileri
 - Walk-forward doğrulama ile genelleme testi (train/test pencereleri ilerletilerek).

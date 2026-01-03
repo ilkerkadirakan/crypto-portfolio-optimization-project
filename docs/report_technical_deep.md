@@ -132,6 +132,17 @@ Teacher (1D, MVSK):
 - Student Sharpe: 2.1237
 - Teacher Sharpe: 2.1189
 
+### 6.4 OOS Holdout (0.25)
+- Student Sharpe: 3.0994
+- Teacher Sharpe: 2.9262
+- Not: OOS %25 döneminde Student ağırlıkları 1/3-1/3-1/3 sabit, Teacher ağırlıkları ~0.50/0.50 sabit kaldı (çok düşük varyans).
+
+### 6.5 ML-Only Kombolar (limit-ml-combos)
+- ML tahmini olan combo sayısı: 212.
+- Student in-sample Sharpe: 0.6441 (winner: BCHBTC_DOGEBTC_SOLBTC_STXBTC_XRPBTC, MVSK).
+- Student OOS (%25) Sharpe: 1.7069 (winner: AAVEBTC_BNBBTC_LTCBTC_SOLBTC_XRPBTC, MVSK).
+- Not: Bu koşuda yalnızca ML tahmini olan combo’lar kullanıldığı için fallback optimizasyon yoktur; önceki yüksek OOS skorların bir kısmı fallback etkisi içerebilir.
+
 ---
 
 ## 7. PGP Neden Kullanılmadı?
