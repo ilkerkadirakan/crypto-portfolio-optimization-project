@@ -342,6 +342,7 @@ def run_student_only(
     xgb_multi_output=False,
     softmax_temp=1.0,
     limit_to_predicted_combos=False,
+    ml_onfly=False,
     oos_split=0.0,
     walk_forward=False,
     wf_train_windows=None,
@@ -484,6 +485,7 @@ def run_student_only(
     print("="*80)
 
     model_list = model_list or ["MV", "MVSK", "MCVaRSK"]
+    version_flag = "ml_onfly" if ml_onfly else "ml"
 
     print(f"[Student] Running backtest with ML weights for {len(combos)} combinations...")
     print(f"[Student] Using parallel processing with checkpoint support...")
@@ -543,7 +545,7 @@ def run_student_only(
 
             batch_results = backtest_engine.run_backtest_parallel(
                 freq=freq,
-                version="ml",
+                version=version_flag,
                 model_list=model_list,
                 combo_iterable=batch_combos,
                 n_jobs=-1,
@@ -864,6 +866,11 @@ if __name__ == "__main__":
         help="Restrict student backtest to combos with ML predictions.",
     )
     parser.add_argument(
+        "--ml-onfly",
+        action="store_true",
+        help="Use on-the-fly ML inference during backtest (no precomputed weights).",
+    )
+    parser.add_argument(
         "--oos-split",
         type=float,
         default=0.0,
@@ -915,6 +922,7 @@ if __name__ == "__main__":
             xgb_multi_output=args.xgb_multi_output,
             softmax_temp=args.softmax_temp,
             limit_to_predicted_combos=args.limit_ml_combos,
+            ml_onfly=args.ml_onfly,
             oos_split=args.oos_split,
             walk_forward=args.walk_forward,
             wf_train_windows=args.wf_train_windows,

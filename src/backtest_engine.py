@@ -21,6 +21,144 @@ from .combination_utils import cache_combinations
 TRANSACTION_COST_BPS = 0.001  # 10 bps per leg
 BASELINE_VERSION = {"baseline", "realized", "realised"}
 ML_VERSION = {"ml", "forecast", "forecasted"}
+_PARALLEL_STATE: Dict[str, object] | None = None
+_ML_ONFLY_MODELS: Dict | None = None
+_ML_ONFLY_FEATURES: pd.DataFrame | None = None
+
+
+def _infer_n_lags(feature_cols: Sequence[str]) -> int:
+    max_lag = 0
+    for col in feature_cols:
+        if "_lag" not in col:
+            continue
+        try:
+            lag_str = col.rsplit("lag", 1)[-1]
+            max_lag = max(max_lag, int(lag_str))
+        except ValueError:
+            continue
+    return max(max_lag, 1)
+
+
+def _load_ml_models_for_onfly(processed_dir: Path, freq: str) -> Dict:
+    import joblib
+
+    models_dir = processed_dir / "ml_models"
+    models_path = models_dir / f"weight_models_{freq.lower()}.pkl"
+    if not models_path.exists():
+        alt_models_dir = processed_dir / "ml_models_user"
+        alt_models_path = alt_models_dir / f"weight_models_{freq.lower()}.pkl"
+        if not alt_models_path.exists():
+            raise FileNotFoundError(
+                f"ML models not found at {models_path} or {alt_models_path}"
+            )
+        models_path = alt_models_path
+    return joblib.load(models_path)
+
+
+def _set_onfly_state(models_dict: Dict | None, features_df: pd.DataFrame | None) -> None:
+    global _ML_ONFLY_MODELS, _ML_ONFLY_FEATURES
+    _ML_ONFLY_MODELS = models_dict
+    _ML_ONFLY_FEATURES = features_df
+
+
+def _set_parallel_state(state: Dict[str, object]) -> None:
+    global _PARALLEL_STATE
+    _PARALLEL_STATE = state
+
+
+def _unpack_task(args: Tuple) -> Tuple:
+    if len(args) == 2 and _PARALLEL_STATE:
+        combo, model_name = args
+        state = _PARALLEL_STATE
+        return (
+            combo,
+            model_name,
+            state["freq_norm"],
+            state["version_norm"],
+            state["returns_df"],
+            state["baseline_panels"],
+            state["forecast_panels"],
+            state["ml_weights_df"],
+            state["index_common"],
+            state["rebalance_positions"],
+            state["cfg_bt"],
+            state["cfg"],
+            state["asset_list_all"],
+            state["results_root"],
+            state["freq_suffix"],
+            state.get("ml_models_dict"),
+            state.get("ml_features_df"),
+        )
+    return args
+
+
+def _init_onfly_worker(processed_dir: str, freq_norm: str, freq_suffix: str) -> None:
+    models_dict = _load_ml_models_for_onfly(Path(processed_dir), freq_norm)
+    feature_cols = models_dict.get("feature_cols", [])
+    asset_list_ml = models_dict.get("asset_list", [])
+    n_lags = _infer_n_lags(feature_cols)
+    moments_path = Path(processed_dir) / f"moments_{freq_suffix}.parquet"
+    moments_df = pd.read_parquet(moments_path)
+    returns_df_ml = _load_returns(freq_norm, Path(processed_dir))
+    from src import ml_weights as _mlw
+    features_df = _mlw._create_lagged_features(
+        moments_df,
+        returns_df_ml,
+        asset_list=list(asset_list_ml),
+        n_lags=n_lags,
+    )
+    _set_onfly_state(models_dict, features_df)
+
+
+def _predict_ml_weights_onfly(
+    models_dict: Dict,
+    feature_row: pd.Series,
+    combo_assets: Sequence[str],
+    target_assets: Sequence[str],
+) -> Optional[np.ndarray]:
+    from src import ml_weights
+
+    feature_cols = models_dict.get("feature_cols", [])
+    asset_list = models_dict.get("asset_list", [])
+    models = models_dict.get("models", {})
+    multi_output = bool(models_dict.get("multi_output_xgb"))
+
+    if not feature_cols or not asset_list or not models:
+        return None
+
+    # Add combo indicators
+    row = feature_row.to_dict()
+    for asset in asset_list:
+        row[f"combo_has_{asset}"] = 1.0 if asset in combo_assets else 0.0
+
+    X_row = pd.DataFrame([row]).reindex(columns=feature_cols).fillna(0.0)
+
+    raw_scores = np.zeros(len(asset_list), dtype=float)
+    if multi_output and "__multi_output_xgb__" in models:
+        preds = models["__multi_output_xgb__"].predict(X_row.values)
+        raw_scores = np.asarray(preds[0], dtype=float)
+    else:
+        for idx, asset in enumerate(asset_list):
+            model_data = models.get(asset)
+            if model_data is None:
+                continue
+            if isinstance(model_data, dict):
+                preds = [m.predict(X_row.values)[0] for m in model_data.values()]
+                raw_scores[idx] = float(np.mean(preds)) if preds else 0.0
+            else:
+                raw_scores[idx] = float(model_data.predict(X_row.values)[0])
+
+    weights_full_ml = ml_weights._apply_portfolio_constraints(
+        raw_scores,
+        asset_list=list(asset_list),
+        combo_assets=list(combo_assets),
+        k=len(combo_assets),
+    )
+    weights_full = np.zeros(len(target_assets), dtype=float)
+    for idx, asset in enumerate(target_assets):
+        if asset in asset_list:
+            weights_full[idx] = weights_full_ml[asset_list.index(asset)]
+    return weights_full
 def _ensure_utf8_stdout() -> None:
     try:
         import sys
@@ -486,16 +624,35 @@ def run_backtest(
     baseline_panels, forecast_panels = _load_moments(freq_norm, processed_dir, version_norm)
     cfg_bt = _get_backtest_config(cfg, freq_norm)
 
+    asset_list_all = list(returns_df.columns)
+
     # Load ML-predicted weights if version is ML
     ml_weights_df = None
+    ml_models_dict = None
+    ml_features_df = None
     if version_norm in ML_VERSION:
         ml_weights_df = _load_ml_weights(freq_norm, processed_dir)
         if ml_weights_df is not None:
             print(f"[Backtest] Using ML-predicted weights for version={version_norm}")
         else:
             print(f"[Backtest] ML weights not available, falling back to baseline optimization")
-
-    asset_list_all = list(returns_df.columns)
+    elif version_norm == "ml_onfly":
+        ml_models_dict = _load_ml_models_for_onfly(processed_dir, freq_norm)
+        feature_cols = ml_models_dict.get("feature_cols", [])
+        asset_list_ml = ml_models_dict.get("asset_list", [])
+        n_lags = _infer_n_lags(feature_cols)
+        moments_path = processed_dir / f"moments_{freq_suffix}.parquet"
+        moments_df = pd.read_parquet(moments_path)
+        returns_df_ml = _load_returns(freq_norm, processed_dir)
+        from src import ml_weights as _mlw
+        ml_features_df = _mlw._create_lagged_features(
+            moments_df,
+            returns_df_ml,
+            asset_list=list(asset_list_ml or asset_list_all),
+            n_lags=n_lags,
+        )
+        _set_onfly_state(ml_models_dict, ml_features_df)
+        print(f"[Backtest] Using on-the-fly ML weights for version={version_norm} (lags={n_lags})")
     simple_returns = (np.exp(returns_df) - 1.0).fillna(0.0)
 
     # Filter index to only include timestamps where moments are available
@@ -571,7 +728,27 @@ def run_backtest(
                 period_index = index_common[start_pos:end_pos]
 
                 use_ml_weights = False
-                if version_norm in ML_VERSION and ml_weights_df is not None:
+                if version_norm == "ml_onfly" and ml_models_dict is not None and ml_features_df is not None:
+                    if ts in ml_features_df.index:
+                        feature_row = ml_features_df.loc[ts]
+                        raw_weights = _predict_ml_weights_onfly(
+                            ml_models_dict,
+                            feature_row,
+                            combo_assets,
+                            asset_list,
+                        )
+                        if raw_weights is not None:
+                            weights_full = raw_weights.copy()
+                            use_ml_weights = True
+                    if not use_ml_weights:
+                        if prev_weights_full.sum() > 0:
+                            weights_full = prev_weights_full.copy()
+                        else:
+                            weights_full = np.full(len(asset_list), 1.0 / len(asset_list))
+                    turnover = float(np.sum(np.abs(weights_full - prev_weights_full)))
+                    transaction_cost = turnover * cfg_bt.transaction_cost
+
+                elif version_norm in ML_VERSION and ml_weights_df is not None:
                     ml_weights = _extract_ml_weights(ml_weights_df, ts, asset_list, combo_label)
                     if ml_weights is not None:
                         weights_full = _sanitize_weights(ml_weights)
@@ -763,11 +940,17 @@ def _process_single_combo_model(args: Tuple) -> Optional[pd.DataFrame]:
     pd.DataFrame or None
         Backtest results for this combo-model pair, or None if processing failed.
     """
+    args = _unpack_task(args)
     (
         combo, model_name, freq_norm, version_norm, returns_df, baseline_panels,
         forecast_panels, ml_weights_df, index_common, rebalance_positions, cfg_bt,
-        cfg, asset_list_all, results_root, freq_suffix
+        cfg, asset_list_all, results_root, freq_suffix, ml_models_dict, ml_features_df
     ) = args
+
+    if ml_models_dict is None:
+        ml_models_dict = _ML_ONFLY_MODELS
+    if ml_features_df is None:
+        ml_features_df = _ML_ONFLY_FEATURES
 
     try:
         combo_label = _combo_label(combo)
@@ -795,7 +978,27 @@ def _process_single_combo_model(args: Tuple) -> Optional[pd.DataFrame]:
             period_index = index_common[start_pos:end_pos]
 
             use_ml_weights = False
-            if version_norm in ML_VERSION and ml_weights_df is not None:
+            if version_norm == "ml_onfly" and ml_models_dict is not None and ml_features_df is not None:
+                if ts in ml_features_df.index:
+                    feature_row = ml_features_df.loc[ts]
+                    raw_weights = _predict_ml_weights_onfly(
+                        ml_models_dict,
+                        feature_row,
+                        combo_assets,
+                        asset_list,
+                    )
+                    if raw_weights is not None:
+                        weights_full = raw_weights.copy()
+                        use_ml_weights = True
+                if not use_ml_weights:
+                    if prev_weights_full.sum() > 0:
+                        weights_full = prev_weights_full.copy()
+                    else:
+                        weights_full = np.full(len(asset_list), 1.0 / len(asset_list))
+                turnover = float(np.sum(np.abs(weights_full - prev_weights_full)))
+                transaction_cost = turnover * cfg_bt.transaction_cost
+
+            elif version_norm in ML_VERSION and ml_weights_df is not None:
                 ml_weights = _extract_ml_weights(ml_weights_df, ts, asset_list, combo_label)
                 if ml_weights is not None:
                     weights_full = _sanitize_weights(ml_weights)
@@ -977,15 +1180,19 @@ def run_backtest_parallel(
     baseline_panels, forecast_panels = _load_moments(freq_norm, processed_dir, version_norm)
     cfg_bt = _get_backtest_config(cfg, freq_norm)
 
+    asset_list_all = list(returns_df.columns)
+
     ml_weights_df = None
+    ml_models_dict = None
+    ml_features_df = None
     if version_norm in ML_VERSION:
         ml_weights_df = _load_ml_weights(freq_norm, processed_dir)
         if ml_weights_df is not None:
             print(f"[Backtest] Using ML-predicted weights for version={version_norm}")
         else:
             print(f"[Backtest] ML weights not available, falling back to baseline optimization")
-
-    asset_list_all = list(returns_df.columns)
+    elif version_norm == "ml_onfly":
+        print(f"[Backtest] Using on-the-fly ML weights for version={version_norm}")
 
     first_valid_moment = baseline_panels.get("mean").dropna(how='all').index[0] if "mean" in baseline_panels and not baseline_panels["mean"].dropna(how='all').empty else None
 
@@ -1028,11 +1235,14 @@ def run_backtest_parallel(
     tasks = []
     for combo in combo_list:
         for model_name in model_list:
-            task_args = (
-                combo, model_name, freq_norm, version_norm, returns_df, baseline_panels,
-                forecast_panels, ml_weights_df, index_common, rebalance_positions, cfg_bt,
-                cfg, asset_list_all, results_root, freq_suffix
-            )
+            if version_norm == "ml_onfly":
+                task_args = (combo, model_name)
+            else:
+                task_args = (
+                    combo, model_name, freq_norm, version_norm, returns_df, baseline_panels,
+                    forecast_panels, ml_weights_df, index_common, rebalance_positions, cfg_bt,
+                    cfg, asset_list_all, results_root, freq_suffix, ml_models_dict, ml_features_df
+                )
             tasks.append(task_args)
 
     total_tasks = len(tasks)
@@ -1048,7 +1258,32 @@ def run_backtest_parallel(
 
     # Process in parallel
     all_runs: List[pd.DataFrame] = []
-    with mp.Pool(processes=n_workers) as pool:
+    if version_norm == "ml_onfly":
+        _set_parallel_state({
+            "freq_norm": freq_norm,
+            "version_norm": version_norm,
+            "returns_df": returns_df,
+            "baseline_panels": baseline_panels,
+            "forecast_panels": forecast_panels,
+            "ml_weights_df": ml_weights_df,
+            "index_common": index_common,
+            "rebalance_positions": rebalance_positions,
+            "cfg_bt": cfg_bt,
+            "cfg": cfg,
+            "asset_list_all": asset_list_all,
+            "results_root": results_root,
+            "freq_suffix": freq_suffix,
+            "ml_models_dict": None,
+            "ml_features_df": None,
+        })
+        pool = mp.Pool(
+            processes=n_workers,
+            initializer=_init_onfly_worker,
+            initargs=(str(processed_dir), freq_norm, freq_suffix),
+        )
+    else:
+        pool = mp.Pool(processes=n_workers)
+    with pool:
         # Use imap_unordered for progress tracking
         results = pool.imap_unordered(_process_single_combo_model, tasks)
 
