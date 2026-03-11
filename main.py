@@ -5,7 +5,10 @@ Entry point module for orchestrating the ML-enhanced moment-based portfolio pipe
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Sequence, Tuple
 
@@ -412,6 +415,84 @@ def _get_completed_combos(checkpoint_df: pd.DataFrame) -> set:
     return completed
 
 
+# Enhanced checkpoint helpers (redefined for safety and backward compatibility)
+def _build_run_signature(
+    freq: str,
+    checkpoint_scope: str,
+    model_list: Sequence[str],
+    combos: Sequence[object],
+) -> str:
+    """Build a stable signature to prevent cross-run checkpoint reuse."""
+    combo_labels = [backtest_engine._combo_label(combo) for combo in combos]
+    combo_labels_sorted = sorted(combo_labels)
+    combo_hash = hashlib.sha256("\n".join(combo_labels_sorted).encode("utf-8")).hexdigest()
+    payload = {
+        "scope": checkpoint_scope.lower(),
+        "freq": str(freq).upper(),
+        "models": sorted(str(m).upper() for m in model_list),
+        "combo_count": len(combo_labels_sorted),
+        "combo_hash": combo_hash,
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _load_checkpoint(checkpoint_path: Path, expected_signature: str | None = None) -> pd.DataFrame:
+    """Load checkpoint if exists and optionally validate run signature."""
+    if checkpoint_path.exists():
+        print(f"[Checkpoint] Loading from {checkpoint_path}")
+        try:
+            df = pd.read_parquet(checkpoint_path)
+        except Exception as exc:
+            print(f"[Checkpoint] Failed to read checkpoint parquet ({exc}). Ignoring file.")
+            return pd.DataFrame()
+
+        if expected_signature is not None:
+            sig_col = "_checkpoint_signature"
+            if sig_col not in df.columns:
+                print("[Checkpoint] Missing signature column in checkpoint. Ignoring old checkpoint.")
+                return pd.DataFrame()
+            checkpoint_signature = str(df[sig_col].iloc[0]) if not df.empty else ""
+            if checkpoint_signature != expected_signature:
+                print("[Checkpoint] Signature mismatch. Ignoring checkpoint from different run setup.")
+                return pd.DataFrame()
+
+        print(f"[Checkpoint] Found {len(df)} previously computed rows")
+        return df
+    return pd.DataFrame()
+
+
+def _save_checkpoint(df: pd.DataFrame, checkpoint_path: Path, signature: str | None = None) -> None:
+    """Save checkpoint atomically to reduce corruption risk on interruptions."""
+    checkpoint_df = df.copy()
+    if signature is not None:
+        checkpoint_df["_checkpoint_signature"] = signature
+    checkpoint_df["_checkpoint_saved_at"] = datetime.now(timezone.utc).isoformat()
+
+    tmp_path = checkpoint_path.with_suffix(checkpoint_path.suffix + ".tmp")
+    checkpoint_df.to_parquet(tmp_path)
+    tmp_path.replace(checkpoint_path)
+    print(f"[Checkpoint] Saved {len(checkpoint_df)} rows")
+
+
+def _get_completed_combos(checkpoint_df: pd.DataFrame) -> set:
+    """Extract completed combo+model pairs from checkpoint."""
+    if checkpoint_df.empty:
+        return set()
+    required_cols = {"combo", "model"}
+    if not required_cols.issubset(set(checkpoint_df.columns)):
+        print("[Checkpoint] Missing required columns (combo/model). Ignoring checkpoint rows.")
+        return set()
+
+    completed = set()
+    for _, group in checkpoint_df.groupby(["combo", "model"]):
+        combo = group["combo"].iloc[0]
+        model = str(group["model"].iloc[0]).upper()
+        completed.add((combo, model))
+
+    return completed
+
+
 def run_pipeline(
     config_path: Path,
     frequencies: Sequence[str] | None,
@@ -500,12 +581,18 @@ def run_pipeline(
 
     for freq in freq_list:
         print(f"\n[Teacher] Testing {len(combos)} combinations at freq={freq}")
+        teacher_signature = _build_run_signature(
+            freq=freq,
+            checkpoint_scope="teacher",
+            model_list=model_list,
+            combos=combos,
+        )
 
         # CHECKPOINT SYSTEM
         checkpoint_path = _get_checkpoint_path(paths["results"], freq, "teacher")
 
         if resume:
-            checkpoint_df = _load_checkpoint(checkpoint_path)
+            checkpoint_df = _load_checkpoint(checkpoint_path, expected_signature=teacher_signature)
             completed_combos = _get_completed_combos(checkpoint_df)
             print(f"[Teacher] Found {len(completed_combos)} completed combo+model pairs")
         else:
@@ -565,7 +652,7 @@ def run_pipeline(
 
                         # Save checkpoint
                         combined_df = pd.concat(all_teacher_results, ignore_index=True)
-                        _save_checkpoint(combined_df, checkpoint_path)
+                        _save_checkpoint(combined_df, checkpoint_path, signature=teacher_signature)
 
             # Combine all results
             if all_teacher_results:
@@ -653,6 +740,12 @@ def run_pipeline(
                     model_types=['lgb', 'xgb', 'rf']  # Use ensemble of all models
                 )
                 print("[Student] ML weight models trained successfully")
+                student_signature = _build_run_signature(
+                    freq=freq,
+                    checkpoint_scope="student",
+                    model_list=model_list,
+                    combos=combos,
+                )
 
                 # Run backtest with ML-predicted weights
                 print(f"[Student] Running backtest with ML weights for {len(combos)} combinations...")
@@ -661,7 +754,10 @@ def run_pipeline(
                 checkpoint_path_student = _get_checkpoint_path(paths["results"], freq, "student")
 
                 if resume:
-                    checkpoint_df_student = _load_checkpoint(checkpoint_path_student)
+                    checkpoint_df_student = _load_checkpoint(
+                        checkpoint_path_student,
+                        expected_signature=student_signature,
+                    )
                     completed_combos_student = _get_completed_combos(checkpoint_df_student)
                     print(f"[Student] Found {len(completed_combos_student)} completed combo+model pairs")
                 else:
@@ -721,7 +817,11 @@ def run_pipeline(
 
                                 # Save checkpoint
                                 combined_df_student = pd.concat(all_student_results, ignore_index=True)
-                                _save_checkpoint(combined_df_student, checkpoint_path_student)
+                                _save_checkpoint(
+                                    combined_df_student,
+                                    checkpoint_path_student,
+                                    signature=student_signature,
+                                )
 
                     # Combine all results
                     if all_student_results:

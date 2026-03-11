@@ -83,6 +83,7 @@ def _save_large_parquet(df: pd.DataFrame, file_path: Path, chunk_size: int = 500
 
     schema = None
     writer = None
+    tmp_path = file_path.with_suffix(file_path.suffix + ".tmp")
 
     try:
         for start_idx in range(0, total_rows, chunk_size):
@@ -94,7 +95,7 @@ def _save_large_parquet(df: pd.DataFrame, file_path: Path, chunk_size: int = 500
 
             if schema is None:
                 schema = table.schema
-                writer = pq.ParquetWriter(file_path, schema)
+                writer = pq.ParquetWriter(tmp_path, schema)
 
             writer.write_table(table)
 
@@ -104,6 +105,7 @@ def _save_large_parquet(df: pd.DataFrame, file_path: Path, chunk_size: int = 500
     finally:
         if writer:
             writer.close()
+    tmp_path.replace(file_path)
 
     print(f"[SaveChunk] ✓ Completed chunked save to {file_path}")
 
@@ -155,6 +157,87 @@ def _get_completed_combos(checkpoint_df: pd.DataFrame) -> set:
         print(f"[Checkpoint] Sample (first 5): {list(completed)[:5]}")
 
     return completed
+
+
+def _build_run_signature(
+    freq: str,
+    version_flag: str,
+    model_list: list[str],
+    combos: list,
+) -> str:
+    combo_labels = sorted(_combo_to_str(combo) for combo in combos)
+    combo_hash = hashlib.sha256("\n".join(combo_labels).encode("utf-8")).hexdigest()
+    payload = {
+        "freq": str(freq).upper(),
+        "version": str(version_flag).lower(),
+        "models": sorted(str(m).upper() for m in model_list),
+        "combo_count": len(combo_labels),
+        "combo_hash": combo_hash,
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _load_checkpoint(checkpoint_path: Path, expected_signature: str | None = None) -> pd.DataFrame:
+    """Load checkpoint if exists, supporting both parquet and CSV formats."""
+    if checkpoint_path.exists():
+        try:
+            print(f"[Checkpoint] Loading from {checkpoint_path}")
+            df = pd.read_parquet(checkpoint_path)
+            if expected_signature is not None:
+                sig_col = "_checkpoint_signature"
+                if sig_col not in df.columns:
+                    print("[Checkpoint] Missing signature column in checkpoint. Ignoring old checkpoint.")
+                    return pd.DataFrame()
+                checkpoint_signature = str(df[sig_col].iloc[0]) if not df.empty else ""
+                if checkpoint_signature != expected_signature:
+                    print("[Checkpoint] Signature mismatch. Ignoring checkpoint from different run setup.")
+                    return pd.DataFrame()
+            print(f"[Checkpoint] Found {len(df)} previously computed rows")
+            return df
+        except Exception as e:
+            print(f"[Checkpoint] Failed to load parquet: {e}")
+
+    csv_path = checkpoint_path.with_suffix('.csv')
+    if csv_path.exists():
+        try:
+            print(f"[Checkpoint] Loading from CSV: {csv_path}")
+            df = pd.read_csv(csv_path)
+            if expected_signature is not None and "_checkpoint_signature" in df.columns and not df.empty:
+                checkpoint_signature = str(df["_checkpoint_signature"].iloc[0])
+                if checkpoint_signature != expected_signature:
+                    print("[Checkpoint] CSV signature mismatch. Ignoring checkpoint.")
+                    return pd.DataFrame()
+            print(f"[Checkpoint] Found {len(df)} previously computed rows from CSV")
+            return df
+        except Exception as e:
+            print(f"[Checkpoint] Failed to load CSV: {e}")
+
+    return pd.DataFrame()
+
+
+def _save_checkpoint(df: pd.DataFrame, checkpoint_path: Path, signature: str | None = None) -> None:
+    """Save checkpoint with atomic parquet write and CSV fallback."""
+    checkpoint_df = df.copy()
+    if signature is not None:
+        checkpoint_df["_checkpoint_signature"] = signature
+    checkpoint_df["_checkpoint_saved_at"] = dt.datetime.utcnow().isoformat()
+    try:
+        if len(checkpoint_df) < 100000:
+            tmp_path = checkpoint_path.with_suffix(checkpoint_path.suffix + ".tmp")
+            checkpoint_df.to_parquet(tmp_path)
+            tmp_path.replace(checkpoint_path)
+        else:
+            _save_large_parquet(checkpoint_df, checkpoint_path)
+        print(f"[Checkpoint] Saved {len(checkpoint_df)} rows")
+    except Exception as e:
+        print(f"[Checkpoint] Error saving checkpoint: {e}")
+        try:
+            csv_path = checkpoint_path.with_suffix('.csv')
+            checkpoint_df.to_csv(csv_path, index=False)
+            print(f"[Checkpoint] Saved as CSV: {csv_path}")
+        except Exception as csv_e:
+            print(f"[Checkpoint] Failed to save as CSV: {csv_e}")
 
 
 def _get_rebalance_timestamps(freq: str, processed_dir: Path) -> list[pd.Timestamp]:
@@ -486,18 +569,25 @@ def run_student_only(
 
     model_list = model_list or ["MV", "MVSK", "MCVaRSK"]
     version_flag = "ml_onfly" if ml_onfly else "ml"
+    run_signature = _build_run_signature(
+        freq=freq,
+        version_flag=version_flag,
+        model_list=model_list,
+        combos=combos,
+    )
+    results_root = project_root / "results"
 
     print(f"[Student] Running backtest with ML weights for {len(combos)} combinations...")
     print(f"[Student] Using parallel processing with checkpoint support...")
 
     # CHECKPOINT SYSTEM
-    checkpoint_path = _get_checkpoint_path(pipeline_results_dir, freq)
+    checkpoint_path = _get_checkpoint_path(results_root, freq)
     if disable_checkpoint:
         print("[Student] Checkpointing disabled for this run")
         checkpoint_df = pd.DataFrame()
         completed_combos = set()
     else:
-        checkpoint_df = _load_checkpoint(checkpoint_path)
+        checkpoint_df = _load_checkpoint(checkpoint_path, expected_signature=run_signature)
         completed_combos = _get_completed_combos(checkpoint_df)
 
     if completed_combos:
@@ -561,7 +651,7 @@ def run_student_only(
                 if not disable_checkpoint:
                     # Save checkpoint
                     combined_df = pd.concat(all_student_results, ignore_index=True)
-                    _save_checkpoint(combined_df, checkpoint_path)
+                    _save_checkpoint(combined_df, checkpoint_path, signature=run_signature)
             else:
                 print(f"[Warning] Batch {batch_start//checkpoint_batch_size + 1} produced no results")
 
