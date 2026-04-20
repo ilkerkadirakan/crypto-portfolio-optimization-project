@@ -104,7 +104,7 @@ def _extract_price_series(mat_payload: Dict[str, np.ndarray], file_path: Path) -
         # dakikalık timestamp dizisi oluştur
         n = price_array.size
         start = pd.Timestamp(year=year, month=month, day=1, hour=0, minute=1)
-        index = pd.date_range(start=start, periods=n, freq="T", tz=None)
+        index = pd.date_range(start=start, periods=n, freq="min", tz=None)
 
         return index.values, price_array
 
@@ -176,7 +176,7 @@ def prepare_data(raw_data_dir: Path | None = None, processed_dir: Path | None = 
     price_frame = price_frame.sort_index()
     price_frame = price_frame[~price_frame.index.duplicated(keep="last")]
 
-    returns_1h = resample_and_log_returns(price_frame, "1H")
+    returns_1h = resample_and_log_returns(price_frame, "1h")
     returns_1d = resample_and_log_returns(price_frame, "1D")
 
     path_1h = out_dir / "returns_1h.parquet"

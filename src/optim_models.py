@@ -14,6 +14,10 @@ import yaml
 
 SUPPORTED_MODELS = {"MV", "MVSK", "MCVARSK"}
 
+# Keep optimization output clean during long batch runs.
+# We suppress only cvxpy-originated user warnings (e.g., "solution may be inaccurate").
+warnings.filterwarnings("ignore", category=UserWarning, module=r"cvxpy")
+
 
 def _load_params() -> Dict[str, dict]:
     """

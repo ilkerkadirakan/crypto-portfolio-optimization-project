@@ -92,7 +92,14 @@ def _unpack_task(args: Tuple) -> Tuple:
     return args
 
 
-def _init_onfly_worker(processed_dir: str, freq_norm: str, freq_suffix: str) -> None:
+def _init_onfly_worker(
+    processed_dir: str,
+    freq_norm: str,
+    freq_suffix: str,
+    parallel_state: Dict[str, object] | None = None,
+) -> None:
+    if parallel_state is not None:
+        _set_parallel_state(parallel_state)
     models_dict = _load_ml_models_for_onfly(Path(processed_dir), freq_norm)
     feature_cols = models_dict.get("feature_cols", [])
     asset_list_ml = models_dict.get("asset_list", [])
@@ -1259,7 +1266,7 @@ def run_backtest_parallel(
     # Process in parallel
     all_runs: List[pd.DataFrame] = []
     if version_norm == "ml_onfly":
-        _set_parallel_state({
+        parallel_state = {
             "freq_norm": freq_norm,
             "version_norm": version_norm,
             "returns_df": returns_df,
@@ -1275,11 +1282,12 @@ def run_backtest_parallel(
             "freq_suffix": freq_suffix,
             "ml_models_dict": None,
             "ml_features_df": None,
-        })
+        }
+        _set_parallel_state(parallel_state)
         pool = mp.Pool(
             processes=n_workers,
             initializer=_init_onfly_worker,
-            initargs=(str(processed_dir), freq_norm, freq_suffix),
+            initargs=(str(processed_dir), freq_norm, freq_suffix, parallel_state),
         )
     else:
         pool = mp.Pool(processes=n_workers)

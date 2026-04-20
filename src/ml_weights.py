@@ -232,6 +232,8 @@ def train_weight_models(
     n_lags: int = LAG_WINDOWS,
     noise_std: float = 0.0,
     noise_samples: int = 0,
+    max_training_rows: int = 2_000_000,
+    generate_predictions: bool = True,
 ) -> None:
     """
     Train ML models to learn portfolio weights from teacher.
@@ -259,9 +261,10 @@ def train_weight_models(
     moments_df = _load_moments(processed_dir, freq)
     returns_df = _load_returns(processed_dir, freq)
 
-    # Extract teacher weights
-    teacher_weights = _extract_teacher_weights(teacher_results)
-    weight_cols = [col for col in teacher_weights.columns if col.startswith('weight_')]
+    # Determine available weight columns without copying the full teacher dataframe.
+    weight_cols = [col for col in teacher_results.columns if col.startswith('weight_')]
+    if not weight_cols:
+        raise ValueError("No weight columns found in teacher results")
     asset_list = [col.replace('weight_', '') for col in weight_cols]
 
     print(f"[ML-Weights] Found {len(asset_list)} assets")
@@ -295,10 +298,30 @@ def train_weight_models(
         top_pairs = teacher_perf.head(max(top_k, 1)).index.tolist()
         print(f"[ML-Weights] Using top {len(top_pairs)} teacher portfolios for training")
 
-    # Filter teacher weights to selected portfolios
-    teacher_weights_best = teacher_weights[
-        teacher_weights.set_index(["combo", "model"]).index.isin(top_pairs)
-    ].copy()
+    max_pairs_safe = 200
+    if len(top_pairs) > max_pairs_safe:
+        warnings.warn(
+            f"[ML-Weights] Too many teacher portfolios selected ({len(top_pairs)}). "
+            f"Using top {max_pairs_safe} for memory safety."
+        )
+        top_pairs = top_pairs[:max_pairs_safe]
+
+    # Filter teacher rows to selected portfolios before selecting weight columns.
+    # This avoids copying tens of millions of rows when top_k_teachers is small.
+    teacher_cols = ['timestamp', 'combo', 'model'] + weight_cols
+    teacher_frames = []
+    for combo, model in top_pairs:
+        pair_mask = teacher_results['combo'].eq(combo) & teacher_results['model'].eq(model)
+        pair_df = teacher_results.loc[pair_mask, teacher_cols]
+        if not pair_df.empty:
+            teacher_frames.append(pair_df)
+
+    if not teacher_frames:
+        warnings.warn("[ML-Weights] No teacher rows matched selected top portfolios")
+        return
+
+    teacher_weights_best = pd.concat(teacher_frames, ignore_index=True)
+    print(f"[ML-Weights] Teacher rows selected for training: {len(teacher_weights_best)}")
 
     n_lags = max(int(n_lags), 1)
     print(f"[ML-Weights] Creating lagged features with {n_lags} lags...")
@@ -317,6 +340,13 @@ def train_weight_models(
         warnings.warn("[ML-Weights] No overlapping timestamps between features and teacher weights")
         return
 
+    if max_training_rows and len(merged_df) > int(max_training_rows):
+        cap = int(max_training_rows)
+        warnings.warn(
+            f"[ML-Weights] Training rows capped from {len(merged_df)} to {cap} for memory safety."
+        )
+        merged_df = merged_df.sort_index().iloc[-cap:]
+
     print(f"[ML-Weights] Training data shape: {merged_df.shape}")
 
     # Add combo indicator features so the model is combo-conditional
@@ -329,17 +359,19 @@ def train_weight_models(
     # Split features and targets
     X = merged_df.drop(columns=weight_cols + ['combo', 'model', 'timestamp'], errors='ignore').fillna(0)
     y = merged_df[weight_cols].fillna(0)
+    X = X.astype(np.float32, copy=False)
+    y = y.astype(np.float32, copy=False)
 
     # Optional noise augmentation to reduce overfitting to exact teacher weights
     if noise_std > 0 and noise_samples > 0:
         noise_samples = max(int(noise_samples), 1)
-        y_base = y.to_numpy(dtype=float)
-        x_base = X.to_numpy(dtype=float)
+        y_base = y.to_numpy(dtype=np.float32, copy=True)
+        x_base = X.to_numpy(dtype=np.float32, copy=True)
         augmented_y = [y_base]
         augmented_x = [x_base]
 
         for _ in range(noise_samples):
-            noise = np.random.normal(0.0, noise_std, size=y_base.shape)
+            noise = np.random.normal(0.0, noise_std, size=y_base.shape).astype(np.float32)
             noisy = y_base + noise
             noisy = np.clip(noisy, 0.0, None)
             row_sums = noisy.sum(axis=1, keepdims=True)
@@ -350,6 +382,11 @@ def train_weight_models(
 
         X = pd.DataFrame(np.vstack(augmented_x), columns=X.columns)
         y = pd.DataFrame(np.vstack(augmented_y), columns=y.columns)
+        X = X.astype(np.float32, copy=False)
+        y = y.astype(np.float32, copy=False)
+
+    X_values = X.to_numpy(dtype=np.float32, copy=False)
+    y_values = y.to_numpy(dtype=np.float32, copy=False)
 
     # Set default model types
     if model_types is None:
@@ -410,7 +447,7 @@ def train_weight_models(
         )
         multi_model = MultiOutputRegressor(model, n_jobs=1)
         try:
-            multi_model.fit(X.values, y.values)
+            multi_model.fit(X_values, y_values)
             models["__multi_output_xgb__"] = multi_model
             print("[ML-Weights]   ✓ Trained multi-output XGBoost model")
         except Exception as exc:
@@ -476,7 +513,7 @@ def train_weight_models(
                         )
 
                     try:
-                        model.fit(X.values, y[asset_col].values)
+                        model.fit(X_values, y[asset_col].to_numpy(dtype=np.float32, copy=False))
                         asset_models[model_type] = model
                     except Exception as exc:
                         warnings.warn(f"[ML-Weights] Failed to train {model_type} for {asset_name}: {exc}")
@@ -536,7 +573,7 @@ def train_weight_models(
                     )
 
                 try:
-                    model.fit(X.values, y[asset_col].values)
+                    model.fit(X_values, y[asset_col].to_numpy(dtype=np.float32, copy=False))
                     models[asset_name] = model
                     print(f"[ML-Weights]   ✓ Trained {model_type} model for {asset_name}")
                 except Exception as exc:
@@ -577,6 +614,11 @@ def train_weight_models(
             f"[ML-Weights] Failed to write {models_path} ({exc}); saved to {alt_models_path} instead."
         )
 
+    if not generate_predictions:
+        print("[ML-Weights] Skipping precomputed prediction export (on-the-fly mode enabled).")
+        print("[ML-Weights] Student training complete!\n")
+        return
+
     # Generate predictions
     if use_ensemble:
         print(f"[ML-Weights] Generating ensemble weight predictions...")
@@ -587,7 +629,7 @@ def train_weight_models(
     if multi_output_xgb and "__multi_output_xgb__" in models:
         model = models["__multi_output_xgb__"]
         try:
-            preds = model.predict(X.values)
+            preds = model.predict(X_values)
             for idx, asset_name in enumerate(asset_list):
                 predictions[f'pred_weight_{asset_name}'] = preds[:, idx]
         except Exception as exc:
@@ -602,7 +644,7 @@ def train_weight_models(
                     weights = []
 
                     for model_type, model in model_data.items():
-                        pred = model.predict(X.values)
+                        pred = model.predict(X_values)
                         ensemble_preds.append(pred)
 
                         # Improved ensemble weighting strategy
@@ -625,7 +667,7 @@ def train_weight_models(
 
                 else:
                     # Single model prediction
-                    pred = model_data.predict(X.values)
+                    pred = model_data.predict(X_values)
                     predictions[f'pred_weight_{asset_name}'] = pred
 
             except Exception as exc:

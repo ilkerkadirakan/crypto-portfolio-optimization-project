@@ -24,7 +24,7 @@ from src import (
     reporting,
 )
 
-DEFAULT_MODELS: Sequence[str] = ("MV", "MVSK", "MCVaRSK")
+DEFAULT_MODELS: Sequence[str] = ("MV", "MVSK", "MCVARSK")
 DEFAULT_VERSIONS: Sequence[str] = ("baseline", "ml")
 
 
@@ -64,7 +64,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--versions",
         nargs="*",
-        help="Optional list of data versions to backtest (baseline, ml). Defaults to both.",
+        help="Optional list of data versions to backtest (baseline, ml, ml_onfly). Defaults to both.",
     )
     parser.add_argument(
         "--models",
@@ -102,6 +102,11 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--skip-moments",
         action="store_true",
         help="Skip moment calculation if moments parquet files already exist.",
+    )
+    parser.add_argument(
+        "--ml-onfly",
+        action="store_true",
+        help="Use on-the-fly ML inference in student backtests (no precomputed ML weight parquet needed).",
     )
     return parser.parse_args(argv)
 
@@ -235,6 +240,8 @@ def _normalize_versions(versions: Sequence[str] | None) -> List[str]:
         "ml": "ml",
         "forecast": "ml",
         "forecasted": "ml",
+        "ml_onfly": "ml",
+        "onfly": "ml",
     }
     normalized: List[str] = []
     for version in versions:
@@ -267,7 +274,7 @@ def _resolve_models(models: Sequence[str] | None) -> List[str]:
     - Provide aliases for common shorthand (e.g., 'mvsk' -> 'MVSK').
     """
     if not models:
-        return [model for model in DEFAULT_MODELS]
+        return [str(model).strip().upper() for model in DEFAULT_MODELS]
     normalized: List[str] = []
     for model in models:
         canonical = str(model).strip().upper()
@@ -437,12 +444,20 @@ def _build_run_signature(
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def _load_checkpoint(checkpoint_path: Path, expected_signature: str | None = None) -> pd.DataFrame:
+def _load_checkpoint(
+    checkpoint_path: Path,
+    expected_signature: str | None = None,
+    columns: Sequence[str] | None = None,
+) -> pd.DataFrame:
     """Load checkpoint if exists and optionally validate run signature."""
     if checkpoint_path.exists():
         print(f"[Checkpoint] Loading from {checkpoint_path}")
         try:
-            df = pd.read_parquet(checkpoint_path)
+            if columns:
+                # Load only the columns needed for resume bookkeeping to avoid OOM
+                df = pd.read_parquet(checkpoint_path, columns=list(columns))
+            else:
+                df = pd.read_parquet(checkpoint_path)
         except Exception as exc:
             print(f"[Checkpoint] Failed to read checkpoint parquet ({exc}). Ignoring file.")
             return pd.DataFrame()
@@ -504,6 +519,7 @@ def run_pipeline(
     checkpoint_batch_size: int = 500,
     skip_prep: bool = False,
     skip_moments: bool = False,
+    ml_onfly: bool = False,
 ) -> None:
     """
     Execute the full portfolio optimization workflow with checkpoint support.
@@ -592,7 +608,11 @@ def run_pipeline(
         checkpoint_path = _get_checkpoint_path(paths["results"], freq, "teacher")
 
         if resume:
-            checkpoint_df = _load_checkpoint(checkpoint_path, expected_signature=teacher_signature)
+            checkpoint_df = _load_checkpoint(
+                checkpoint_path,
+                expected_signature=teacher_signature,
+                columns=["combo", "model", "_checkpoint_signature", "_checkpoint_saved_at"],
+            )
             completed_combos = _get_completed_combos(checkpoint_df)
             print(f"[Teacher] Found {len(completed_combos)} completed combo+model pairs")
         else:
@@ -600,19 +620,24 @@ def run_pipeline(
             completed_combos = set()
 
         # Filter remaining combinations per model
-        remaining_by_model = {model: [] for model in model_list}
+        remaining_by_model = {str(model).strip().upper(): [] for model in model_list}
         for combo in combos:
             combo_str = backtest_engine._combo_label(combo)
             for model in model_list:
-                if (combo_str, model) not in completed_combos:
-                    remaining_by_model[model].append(combo)
+                model_key = str(model).strip().upper()
+                if (combo_str, model_key) not in completed_combos:
+                    remaining_by_model[model_key].append(combo)
 
         remaining_total = sum(len(items) for items in remaining_by_model.values())
         print(f"[Teacher] Remaining combo+model pairs to process: {remaining_total}")
         for model in model_list:
-            print(f"[Teacher]   {model}: {len(remaining_by_model[model])}/{len(combos)} combos")
+            model_key = str(model).strip().upper()
+            print(f"[Teacher]   {model_key}: {len(remaining_by_model[model_key])}/{len(combos)} combos")
 
         if remaining_total == 0 and not checkpoint_df.empty:
+            # Resume bookkeeping may have loaded only minimal columns; reload full data only when needed.
+            if "net_return" not in checkpoint_df.columns:
+                checkpoint_df = _load_checkpoint(checkpoint_path, expected_signature=teacher_signature)
             print("[Teacher] All combinations already completed (using checkpoint)")
             teacher_results = checkpoint_df
         else:
@@ -620,7 +645,8 @@ def run_pipeline(
             all_teacher_results = [checkpoint_df] if not checkpoint_df.empty else []
 
             for model in model_list:
-                remaining_combos = remaining_by_model[model]
+                model_key = str(model).strip().upper()
+                remaining_combos = remaining_by_model[model_key]
                 if not remaining_combos:
                     continue
 
@@ -628,14 +654,14 @@ def run_pipeline(
                     batch_end = min(batch_start + checkpoint_batch_size, len(remaining_combos))
                     batch_combos = remaining_combos[batch_start:batch_end]
 
-                    print(f"\n[Teacher] Processing {model} batch {batch_start//checkpoint_batch_size + 1}: "
+                    print(f"\n[Teacher] Processing {model_key} batch {batch_start//checkpoint_batch_size + 1}: "
                           f"combos {batch_start+1}-{batch_end}/{len(remaining_combos)}")
 
                     if use_parallel:
                         batch_results = backtest_engine.run_backtest_parallel(
                             freq=freq,
                             version="baseline",
-                            model_list=[model],
+                            model_list=[model_key],
                             combo_iterable=batch_combos,
                             n_jobs=n_jobs,
                         )
@@ -643,7 +669,7 @@ def run_pipeline(
                         batch_results = backtest_engine.run_backtest(
                             freq=freq,
                             version="baseline",
-                            model_list=[model],
+                            model_list=[model_key],
                             combo_iterable=batch_combos,
                         )
 
@@ -732,23 +758,29 @@ def run_pipeline(
             try:
                 from src import ml_weights
                 print("[Student] Training ML models to learn portfolio weights...")
+                student_version = "ml_onfly" if ml_onfly else "ml"
                 ml_weights.train_weight_models(
                     teacher_results=teacher_results,
                     processed_dir=paths["processed"],
                     freq=freq,
-                    use_ensemble=True,
-                    model_types=['lgb', 'xgb', 'rf']  # Use ensemble of all models
+                    use_ensemble=False,
+                    model_types=['xgb', 'lgb', 'rf'],
+                    use_multi_output_xgb=True,
+                    generate_predictions=not ml_onfly,
                 )
                 print("[Student] ML weight models trained successfully")
                 student_signature = _build_run_signature(
                     freq=freq,
-                    checkpoint_scope="student",
+                    checkpoint_scope=f"student_{student_version}",
                     model_list=model_list,
                     combos=combos,
                 )
 
                 # Run backtest with ML-predicted weights
-                print(f"[Student] Running backtest with ML weights for {len(combos)} combinations...")
+                if ml_onfly:
+                    print(f"[Student] Running backtest with on-the-fly ML weights for {len(combos)} combinations...")
+                else:
+                    print(f"[Student] Running backtest with ML weights for {len(combos)} combinations...")
 
                 # CHECKPOINT SYSTEM FOR STUDENT
                 checkpoint_path_student = _get_checkpoint_path(paths["results"], freq, "student")
@@ -757,6 +789,7 @@ def run_pipeline(
                     checkpoint_df_student = _load_checkpoint(
                         checkpoint_path_student,
                         expected_signature=student_signature,
+                        columns=["combo", "model", "_checkpoint_signature", "_checkpoint_saved_at"],
                     )
                     completed_combos_student = _get_completed_combos(checkpoint_df_student)
                     print(f"[Student] Found {len(completed_combos_student)} completed combo+model pairs")
@@ -765,19 +798,26 @@ def run_pipeline(
                     completed_combos_student = set()
 
                 # Filter remaining combinations per model for student
-                remaining_by_model_student = {model: [] for model in model_list}
+                remaining_by_model_student = {str(model).strip().upper(): [] for model in model_list}
                 for combo in combos:
                     combo_str = backtest_engine._combo_label(combo)
                     for model in model_list:
-                        if (combo_str, model) not in completed_combos_student:
-                            remaining_by_model_student[model].append(combo)
+                        model_key = str(model).strip().upper()
+                        if (combo_str, model_key) not in completed_combos_student:
+                            remaining_by_model_student[model_key].append(combo)
 
                 remaining_total_student = sum(len(items) for items in remaining_by_model_student.values())
                 print(f"[Student] Remaining combo+model pairs to process: {remaining_total_student}")
                 for model in model_list:
-                    print(f"[Student]   {model}: {len(remaining_by_model_student[model])}/{len(combos)} combos")
+                    model_key = str(model).strip().upper()
+                    print(f"[Student]   {model_key}: {len(remaining_by_model_student[model_key])}/{len(combos)} combos")
 
                 if remaining_total_student == 0 and not checkpoint_df_student.empty:
+                    if "net_return" not in checkpoint_df_student.columns:
+                        checkpoint_df_student = _load_checkpoint(
+                            checkpoint_path_student,
+                            expected_signature=student_signature,
+                        )
                     print("[Student] All combinations already completed (using checkpoint)")
                     student_results = checkpoint_df_student
                 else:
@@ -785,7 +825,8 @@ def run_pipeline(
                     all_student_results = [checkpoint_df_student] if not checkpoint_df_student.empty else []
 
                     for model in model_list:
-                        remaining_combos_student = remaining_by_model_student[model]
+                        model_key = str(model).strip().upper()
+                        remaining_combos_student = remaining_by_model_student[model_key]
                         if not remaining_combos_student:
                             continue
 
@@ -793,22 +834,22 @@ def run_pipeline(
                             batch_end = min(batch_start + checkpoint_batch_size, len(remaining_combos_student))
                             batch_combos = remaining_combos_student[batch_start:batch_end]
 
-                            print(f"\n[Student] Processing {model} batch {batch_start//checkpoint_batch_size + 1}: "
+                            print(f"\n[Student] Processing {model_key} batch {batch_start//checkpoint_batch_size + 1}: "
                                   f"combos {batch_start+1}-{batch_end}/{len(remaining_combos_student)}")
 
                             if use_parallel:
                                 batch_results = backtest_engine.run_backtest_parallel(
                                     freq=freq,
-                                    version="ml",
-                                    model_list=[model],
+                                    version=student_version,
+                                    model_list=[model_key],
                                     combo_iterable=batch_combos,
                                     n_jobs=n_jobs,
                                 )
                             else:
                                 batch_results = backtest_engine.run_backtest(
                                     freq=freq,
-                                    version="ml",
-                                    model_list=[model],
+                                    version=student_version,
+                                    model_list=[model_key],
                                     combo_iterable=batch_combos,
                                 )
 
@@ -971,6 +1012,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             checkpoint_batch_size=args.checkpoint_batch_size,
             skip_prep=args.skip_prep,
             skip_moments=args.skip_moments,
+            ml_onfly=args.ml_onfly,
         )
         return 0
     except Exception as exc:  # pragma: no cover - defensive guard for CLI usage
