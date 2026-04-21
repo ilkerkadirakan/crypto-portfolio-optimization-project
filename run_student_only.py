@@ -140,6 +140,112 @@ def _combo_to_str(combo) -> str:
     return str(combo)
 
 
+def _top_combo_labels_from_ranking(
+    pipeline_results_dir: Path,
+    freq: str,
+    top_combos: int,
+    teacher_results: pd.DataFrame | None = None,
+) -> list[str]:
+    """Return top-N unique combo labels ordered by teacher ranking."""
+    if top_combos <= 0:
+        return []
+
+    ranking_path = pipeline_results_dir / f"teacher_ranking_{freq.lower()}.csv"
+    labels: list[str] = []
+
+    if ranking_path.exists():
+        ranking_df = pd.read_csv(ranking_path)
+        if "combo" in ranking_df.columns:
+            for combo in ranking_df["combo"].astype(str):
+                if combo not in labels:
+                    labels.append(combo)
+                if len(labels) >= top_combos:
+                    break
+            if labels:
+                return labels
+
+    # Fallback: derive ranking from teacher parquet if CSV is missing/incomplete.
+    if teacher_results is None or teacher_results.empty:
+        return labels
+
+    teacher_grouped = teacher_results.groupby(["combo", "model"])["net_return"].agg(["mean", "std", "count"])
+    daily_sharpe = teacher_grouped["mean"] / (teacher_grouped["std"] + 1e-10)
+    teacher_grouped["sharpe"] = daily_sharpe * np.sqrt(365)
+    teacher_ranking = teacher_grouped.sort_values("sharpe", ascending=False).reset_index()
+    for combo in teacher_ranking["combo"].astype(str):
+        if combo not in labels:
+            labels.append(combo)
+        if len(labels) >= top_combos:
+            break
+    return labels
+
+
+def _load_teacher_results_filtered(
+    teacher_path: Path,
+    combo_filter: set[str] | None = None,
+) -> pd.DataFrame:
+    """
+    Load teacher parquet with memory-aware column and optional combo filtering.
+    """
+    import pyarrow.parquet as pq
+    import pyarrow.dataset as ds
+
+    schema_cols = pq.ParquetFile(teacher_path).schema.names
+    weight_cols = [c for c in schema_cols if c.startswith("weight_")]
+    needed_cols = ["timestamp", "combo", "model", "net_return"] + weight_cols
+    needed_cols = [c for c in needed_cols if c in schema_cols]
+
+    if combo_filter:
+        combo_list = sorted(str(c) for c in combo_filter)
+        dataset = ds.dataset(str(teacher_path), format="parquet")
+        table = dataset.to_table(
+            columns=needed_cols,
+            filter=ds.field("combo").isin(combo_list),
+        )
+        return table.to_pandas()
+
+    return pd.read_parquet(teacher_path, columns=needed_cols)
+
+
+def _load_teacher_results_multi_source(
+    pipeline_teacher_path: Path,
+    checkpoint_base_path: Path,
+    checkpoint_delta_path: Path,
+    combo_filter: set[str] | None = None,
+) -> pd.DataFrame:
+    """
+    Load teacher results from available sources, preferring checkpoints (base+delta) when present.
+    """
+    sources: list[Path] = []
+    if checkpoint_base_path.exists():
+        sources.append(checkpoint_base_path)
+    if checkpoint_delta_path.exists():
+        sources.append(checkpoint_delta_path)
+    if not sources and pipeline_teacher_path.exists():
+        sources.append(pipeline_teacher_path)
+
+    if not sources:
+        return pd.DataFrame()
+
+    frames = []
+    for src in sources:
+        try:
+            part = _load_teacher_results_filtered(src, combo_filter=combo_filter)
+            if not part.empty:
+                frames.append(part)
+        except Exception as exc:
+            print(f"[Student-Only] Warning: failed to load teacher source {src}: {exc}")
+
+    if not frames:
+        return pd.DataFrame()
+
+    combined = pd.concat(frames, ignore_index=True)
+    dedup_keys = [k for k in ("timestamp", "combo", "model") if k in combined.columns]
+    if dedup_keys:
+        combined = combined.drop_duplicates(subset=dedup_keys, keep="last")
+    return combined
+
+
 def _get_completed_combos(checkpoint_df: pd.DataFrame) -> set:
     """Extract completed combo+model pairs from checkpoint."""
     if checkpoint_df.empty:
@@ -414,6 +520,7 @@ def run_student_only(
     checkpoint_batch_size=500,
     model_choice="ensemble",
     combo_limit=None,
+    top_combos=None,
     combo_sizes=None,
     top_k_teachers=1,
     same_asset_count=False,
@@ -443,17 +550,45 @@ def run_student_only(
     project_root = Path(__file__).resolve().parent
     processed_dir = project_root / "data" / "processed"
     pipeline_results_dir = project_root / "results" / "pipeline"
+    checkpoints_dir = project_root / "results" / "checkpoints"
 
     # Load existing teacher results
     teacher_path = pipeline_results_dir / f"teacher_{freq.lower()}.parquet"
+    checkpoint_teacher_base = checkpoints_dir / f"checkpoint_teacher_{freq.lower()}.parquet"
+    checkpoint_teacher_delta = checkpoints_dir / f"checkpoint_teacher_{freq.lower()}__delta.parquet"
 
-    if not teacher_path.exists():
+    if not teacher_path.exists() and not checkpoint_teacher_base.exists() and not checkpoint_teacher_delta.exists():
         print(f"[Error] Teacher results not found at {teacher_path}")
-        print("[Error] Please run the full pipeline first with: python main.py --frequencies 1D")
+        print(f"[Error] Teacher checkpoints not found at {checkpoint_teacher_base}")
+        print("[Error] Please run teacher pipeline first.")
         return
 
-    print(f"[Student-Only] Loading teacher results from {teacher_path}")
-    teacher_results = pd.read_parquet(teacher_path)
+    preselected_top_labels: list[str] = []
+    if top_combos is not None and int(top_combos) > 0:
+        preselected_top_labels = _top_combo_labels_from_ranking(
+            pipeline_results_dir=pipeline_results_dir,
+            freq=freq,
+            top_combos=max(int(top_combos), 0),
+            teacher_results=None,
+        )
+        if preselected_top_labels:
+            print(f"[Student-Only] Preselected {len(preselected_top_labels)} top combos from teacher ranking")
+
+    source_desc = []
+    if checkpoint_teacher_base.exists():
+        source_desc.append(str(checkpoint_teacher_base))
+    if checkpoint_teacher_delta.exists():
+        source_desc.append(str(checkpoint_teacher_delta))
+    if not source_desc:
+        source_desc.append(str(teacher_path))
+    print(f"[Student-Only] Loading teacher results from: {', '.join(source_desc)}")
+    combo_filter_set = set(preselected_top_labels) if preselected_top_labels else None
+    teacher_results = _load_teacher_results_multi_source(
+        pipeline_teacher_path=teacher_path,
+        checkpoint_base_path=checkpoint_teacher_base,
+        checkpoint_delta_path=checkpoint_teacher_delta,
+        combo_filter=combo_filter_set,
+    )
     print(f"[Student-Only] Loaded {len(teacher_results)} teacher backtest rows")
     teacher_results = teacher_results.copy()
     teacher_results["timestamp"] = pd.to_datetime(teacher_results["timestamp"])
@@ -470,6 +605,23 @@ def run_student_only(
 
     if combo_limit is not None:
         combos = combos[:max(combo_limit, 0)]
+
+    if top_combos is not None:
+        top_combos = max(int(top_combos), 0)
+        if top_combos > 0:
+            top_labels = preselected_top_labels or _top_combo_labels_from_ranking(
+                pipeline_results_dir=pipeline_results_dir,
+                freq=freq,
+                top_combos=top_combos,
+                teacher_results=teacher_results,
+            )
+            top_label_set = set(top_labels)
+            combos_before = len(combos)
+            combos = [c for c in combos if _combo_to_str(c) in top_label_set]
+            print(
+                f"[Student-Only] Applied top combo filter: top {top_combos} "
+                f"teacher combos -> {len(combos)}/{combos_before} combinations"
+            )
 
     print(f"[Student-Only] Found {len(combos)} portfolio combinations")
 
@@ -888,6 +1040,12 @@ if __name__ == "__main__":
         help="Limit the number of combinations for a fast test.",
     )
     parser.add_argument(
+        "--top-combos",
+        type=int,
+        default=None,
+        help="Use only top-N unique combos from teacher_ranking_<freq>.csv.",
+    )
+    parser.add_argument(
         "--combo-sizes",
         nargs="*",
         type=int,
@@ -1001,6 +1159,7 @@ if __name__ == "__main__":
             checkpoint_batch_size=500,
             model_choice=args.model,
             combo_limit=args.combo_limit,
+            top_combos=args.top_combos,
             combo_sizes=args.combo_sizes,
             top_k_teachers=args.top_k_teachers,
             same_asset_count=args.same_asset_count,

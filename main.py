@@ -392,6 +392,19 @@ def _get_checkpoint_path(results_dir: Path, freq: str, version: str) -> Path:
     return checkpoint_dir / f"checkpoint_{version}_{freq.lower()}.parquet"
 
 
+def _get_delta_checkpoint_path(checkpoint_path: Path) -> Path:
+    """Companion checkpoint used for resume-safe incremental writes."""
+    return checkpoint_path.with_name(f"{checkpoint_path.stem}__delta{checkpoint_path.suffix}")
+
+
+def _has_backtest_payload(df: pd.DataFrame) -> bool:
+    """Whether DataFrame appears to include detailed backtest rows (not bookkeeping-only)."""
+    if df.empty:
+        return False
+    required = {"timestamp", "combo", "model", "net_return"}
+    return required.issubset(set(df.columns))
+
+
 def _load_checkpoint(checkpoint_path: Path) -> pd.DataFrame:
     """Load checkpoint if exists."""
     if checkpoint_path.exists():
@@ -498,9 +511,13 @@ def _get_completed_combos(checkpoint_df: pd.DataFrame) -> set:
     if not required_cols.issubset(set(checkpoint_df.columns)):
         print("[Checkpoint] Missing required columns (combo/model). Ignoring checkpoint rows.")
         return set()
+    if "net_return" not in checkpoint_df.columns:
+        print("[Checkpoint] Missing net_return column; refusing to mark rows as completed.")
+        return set()
 
     completed = set()
-    for _, group in checkpoint_df.groupby(["combo", "model"]):
+    valid = checkpoint_df[checkpoint_df["net_return"].notna()]
+    for _, group in valid.groupby(["combo", "model"]):
         combo = group["combo"].iloc[0]
         model = str(group["model"].iloc[0]).upper()
         completed.add((combo, model))
@@ -606,17 +623,28 @@ def run_pipeline(
 
         # CHECKPOINT SYSTEM
         checkpoint_path = _get_checkpoint_path(paths["results"], freq, "teacher")
+        checkpoint_path_delta = _get_delta_checkpoint_path(checkpoint_path)
 
         if resume:
             checkpoint_df = _load_checkpoint(
                 checkpoint_path,
                 expected_signature=teacher_signature,
-                columns=["combo", "model", "_checkpoint_signature", "_checkpoint_saved_at"],
+                columns=["combo", "model", "net_return", "_checkpoint_signature", "_checkpoint_saved_at"],
             )
-            completed_combos = _get_completed_combos(checkpoint_df)
+            checkpoint_df_delta = _load_checkpoint(
+                checkpoint_path_delta,
+                expected_signature=teacher_signature,
+                columns=["combo", "model", "net_return", "_checkpoint_signature", "_checkpoint_saved_at"],
+            )
+            completion_df = pd.concat(
+                [df for df in (checkpoint_df, checkpoint_df_delta) if not df.empty],
+                ignore_index=True,
+            ) if (not checkpoint_df.empty or not checkpoint_df_delta.empty) else pd.DataFrame()
+            completed_combos = _get_completed_combos(completion_df)
             print(f"[Teacher] Found {len(completed_combos)} completed combo+model pairs")
         else:
             checkpoint_df = pd.DataFrame()
+            checkpoint_df_delta = pd.DataFrame()
             completed_combos = set()
 
         # Filter remaining combinations per model
@@ -634,15 +662,34 @@ def run_pipeline(
             model_key = str(model).strip().upper()
             print(f"[Teacher]   {model_key}: {len(remaining_by_model[model_key])}/{len(combos)} combos")
 
-        if remaining_total == 0 and not checkpoint_df.empty:
+        ranking_seed_parts = []
+        if not checkpoint_df.empty and {"combo", "model", "net_return"}.issubset(set(checkpoint_df.columns)):
+            ranking_seed_parts.append(checkpoint_df[["combo", "model", "net_return"]])
+        if not checkpoint_df_delta.empty and {"combo", "model", "net_return"}.issubset(set(checkpoint_df_delta.columns)):
+            ranking_seed_parts.append(checkpoint_df_delta[["combo", "model", "net_return"]])
+
+        checkpoint_write_path = checkpoint_path
+        if resume and not checkpoint_df.empty and not _has_backtest_payload(checkpoint_df):
+            checkpoint_write_path = checkpoint_path_delta
+            print(
+                f"[Checkpoint] Base checkpoint loaded in bookkeeping mode; "
+                f"new rows will be written to delta: {checkpoint_write_path}"
+            )
+        teacher_using_delta_mode = checkpoint_write_path == checkpoint_path_delta
+
+        seed_teacher_results = pd.DataFrame()
+        if _has_backtest_payload(checkpoint_df_delta):
+            seed_teacher_results = checkpoint_df_delta
+
+        if remaining_total == 0 and (not checkpoint_df.empty or not checkpoint_df_delta.empty):
             # Resume bookkeeping may have loaded only minimal columns; reload full data only when needed.
-            if "net_return" not in checkpoint_df.columns:
+            if "net_return" not in checkpoint_df.columns and checkpoint_write_path == checkpoint_path:
                 checkpoint_df = _load_checkpoint(checkpoint_path, expected_signature=teacher_signature)
             print("[Teacher] All combinations already completed (using checkpoint)")
-            teacher_results = checkpoint_df
+            teacher_results = seed_teacher_results
         else:
             # Process in batches with checkpoints
-            all_teacher_results = [checkpoint_df] if not checkpoint_df.empty else []
+            all_teacher_results = [seed_teacher_results] if not seed_teacher_results.empty else []
 
             for model in model_list:
                 model_key = str(model).strip().upper()
@@ -678,7 +725,7 @@ def run_pipeline(
 
                         # Save checkpoint
                         combined_df = pd.concat(all_teacher_results, ignore_index=True)
-                        _save_checkpoint(combined_df, checkpoint_path, signature=teacher_signature)
+                        _save_checkpoint(combined_df, checkpoint_write_path, signature=teacher_signature)
 
             # Combine all results
             if all_teacher_results:
@@ -686,21 +733,38 @@ def run_pipeline(
             else:
                 teacher_results = pd.DataFrame()
 
-        if teacher_results.empty:
+        ranking_frames = list(ranking_seed_parts)
+        if not teacher_results.empty and {"combo", "model", "net_return"}.issubset(set(teacher_results.columns)):
+            ranking_frames.append(teacher_results[["combo", "model", "net_return"]])
+        teacher_ranking_input = pd.concat(ranking_frames, ignore_index=True) if ranking_frames else pd.DataFrame()
+        if not teacher_ranking_input.empty:
+            teacher_ranking_input = teacher_ranking_input[teacher_ranking_input["net_return"].notna()]
+
+        teacher_has_detailed_payload = _has_backtest_payload(teacher_results) and any(
+            str(col).startswith("weight_") for col in teacher_results.columns
+        )
+
+        if teacher_ranking_input.empty:
             print(f"[Teacher] No results for freq={freq}. Skipping.")
             continue
 
         # Save teacher results
         teacher_path = pipeline_results_dir / f"teacher_{freq.lower()}.parquet"
-        teacher_results.to_parquet(teacher_path)
-        print(f"[Teacher] Saved results to {teacher_path}")
-        run_outputs.append(teacher_results)
+        if teacher_has_detailed_payload and not teacher_using_delta_mode:
+            teacher_results.to_parquet(teacher_path)
+            print(f"[Teacher] Saved results to {teacher_path}")
+            run_outputs.append(teacher_results)
+        else:
+            print(
+                "[Teacher] Skipping overwrite of teacher parquet "
+                "(delta resume mode or missing detailed payload)."
+            )
 
         # STEP 2: Generate TEACHER RANKING
         print(f"\nSTEP 2: Generating TEACHER RANKING for freq={freq}")
 
         import numpy as np
-        teacher_grouped = teacher_results.groupby(['combo', 'model'])['net_return'].agg(['mean', 'std', 'count'])
+        teacher_grouped = teacher_ranking_input.groupby(['combo', 'model'])['net_return'].agg(['mean', 'std', 'count'])
         # Calculate annualized Sharpe ratio using 365-day convention
         daily_sharpe = teacher_grouped['mean'] / (teacher_grouped['std'] + 1e-10)
         teacher_grouped['sharpe'] = daily_sharpe * np.sqrt(365)
@@ -753,6 +817,12 @@ def run_pipeline(
             print(f"\n" + "="*80)
             print("STEP 3: STUDENT PORTFOLIOS (ML Direct Weight Learning)")
             print("="*80)
+            if not teacher_has_detailed_payload or teacher_using_delta_mode:
+                print(
+                    "[Student] Skipping ML step: teacher data is running in delta resume mode "
+                    "or detailed rows are unavailable. Consolidate teacher checkpoints first."
+                )
+                continue
 
             # Import ML weights module (we'll create this)
             try:
@@ -784,17 +854,28 @@ def run_pipeline(
 
                 # CHECKPOINT SYSTEM FOR STUDENT
                 checkpoint_path_student = _get_checkpoint_path(paths["results"], freq, "student")
+                checkpoint_path_student_delta = _get_delta_checkpoint_path(checkpoint_path_student)
 
                 if resume:
                     checkpoint_df_student = _load_checkpoint(
                         checkpoint_path_student,
                         expected_signature=student_signature,
-                        columns=["combo", "model", "_checkpoint_signature", "_checkpoint_saved_at"],
+                        columns=["combo", "model", "net_return", "_checkpoint_signature", "_checkpoint_saved_at"],
                     )
-                    completed_combos_student = _get_completed_combos(checkpoint_df_student)
+                    checkpoint_df_student_delta = _load_checkpoint(
+                        checkpoint_path_student_delta,
+                        expected_signature=student_signature,
+                        columns=["combo", "model", "net_return", "_checkpoint_signature", "_checkpoint_saved_at"],
+                    )
+                    completion_df_student = pd.concat(
+                        [df for df in (checkpoint_df_student, checkpoint_df_student_delta) if not df.empty],
+                        ignore_index=True,
+                    ) if (not checkpoint_df_student.empty or not checkpoint_df_student_delta.empty) else pd.DataFrame()
+                    completed_combos_student = _get_completed_combos(completion_df_student)
                     print(f"[Student] Found {len(completed_combos_student)} completed combo+model pairs")
                 else:
                     checkpoint_df_student = pd.DataFrame()
+                    checkpoint_df_student_delta = pd.DataFrame()
                     completed_combos_student = set()
 
                 # Filter remaining combinations per model for student
@@ -812,17 +893,36 @@ def run_pipeline(
                     model_key = str(model).strip().upper()
                     print(f"[Student]   {model_key}: {len(remaining_by_model_student[model_key])}/{len(combos)} combos")
 
-                if remaining_total_student == 0 and not checkpoint_df_student.empty:
+                checkpoint_write_path_student = checkpoint_path_student
+                if resume and not checkpoint_df_student.empty and not _has_backtest_payload(checkpoint_df_student):
+                    checkpoint_write_path_student = checkpoint_path_student_delta
+                    print(
+                        f"[Checkpoint] Student base checkpoint loaded in bookkeeping mode; "
+                        f"new rows will be written to delta: {checkpoint_write_path_student}"
+                    )
+                student_using_delta_mode = checkpoint_write_path_student == checkpoint_path_student_delta
+
+                seed_student_results = pd.DataFrame()
+                if _has_backtest_payload(checkpoint_df_student_delta):
+                    seed_student_results = checkpoint_df_student_delta
+
+                ranking_seed_student_parts = []
+                if not checkpoint_df_student.empty and {"combo", "model", "net_return"}.issubset(set(checkpoint_df_student.columns)):
+                    ranking_seed_student_parts.append(checkpoint_df_student[["combo", "model", "net_return"]])
+                if not checkpoint_df_student_delta.empty and {"combo", "model", "net_return"}.issubset(set(checkpoint_df_student_delta.columns)):
+                    ranking_seed_student_parts.append(checkpoint_df_student_delta[["combo", "model", "net_return"]])
+
+                if remaining_total_student == 0 and (not checkpoint_df_student.empty or not checkpoint_df_student_delta.empty):
                     if "net_return" not in checkpoint_df_student.columns:
                         checkpoint_df_student = _load_checkpoint(
-                            checkpoint_path_student,
+                            checkpoint_write_path_student,
                             expected_signature=student_signature,
                         )
                     print("[Student] All combinations already completed (using checkpoint)")
-                    student_results = checkpoint_df_student
+                    student_results = seed_student_results
                 else:
                     # Process in batches with checkpoints
-                    all_student_results = [checkpoint_df_student] if not checkpoint_df_student.empty else []
+                    all_student_results = [seed_student_results] if not seed_student_results.empty else []
 
                     for model in model_list:
                         model_key = str(model).strip().upper()
@@ -860,7 +960,7 @@ def run_pipeline(
                                 combined_df_student = pd.concat(all_student_results, ignore_index=True)
                                 _save_checkpoint(
                                     combined_df_student,
-                                    checkpoint_path_student,
+                                    checkpoint_write_path_student,
                                     signature=student_signature,
                                 )
 
@@ -870,16 +970,37 @@ def run_pipeline(
                     else:
                         student_results = pd.DataFrame()
 
-                if not student_results.empty:
+                student_ranking_input_frames = list(ranking_seed_student_parts)
+                if not student_results.empty and {"combo", "model", "net_return"}.issubset(set(student_results.columns)):
+                    student_ranking_input_frames.append(student_results[["combo", "model", "net_return"]])
+                student_ranking_input = (
+                    pd.concat(student_ranking_input_frames, ignore_index=True)
+                    if student_ranking_input_frames
+                    else pd.DataFrame()
+                )
+                if not student_ranking_input.empty:
+                    student_ranking_input = student_ranking_input[student_ranking_input["net_return"].notna()]
+
+                student_has_detailed_payload = _has_backtest_payload(student_results) and any(
+                    str(col).startswith("weight_") for col in student_results.columns
+                )
+
+                if not student_ranking_input.empty:
                     student_path = pipeline_results_dir / f"student_{freq.lower()}.parquet"
-                    student_results.to_parquet(student_path)
-                    print(f"[Student] Saved results to {student_path}")
-                    run_outputs.append(student_results)
+                    if student_has_detailed_payload and not student_using_delta_mode:
+                        student_results.to_parquet(student_path)
+                        print(f"[Student] Saved results to {student_path}")
+                        run_outputs.append(student_results)
+                    else:
+                        print(
+                            "[Student] Skipping overwrite of student parquet "
+                            "(delta resume mode or missing detailed payload)."
+                        )
 
                     # STEP 4: Generate STUDENT RANKING
                     print(f"\n STEP 4: Generating STUDENT RANKING for freq={freq}")
 
-                    student_grouped = student_results.groupby(['combo', 'model'])['net_return'].agg(['mean', 'std', 'count'])
+                    student_grouped = student_ranking_input.groupby(['combo', 'model'])['net_return'].agg(['mean', 'std', 'count'])
                     # Calculate annualized Sharpe ratio using 365-day convention
                     daily_sharpe_student = student_grouped['mean'] / (student_grouped['std'] + 1e-10)
                     student_grouped['sharpe'] = daily_sharpe_student * np.sqrt(365)
