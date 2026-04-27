@@ -129,6 +129,15 @@ def _archive_file(src: Path, dest_dir: Path, stem_suffix: str) -> None:
     dest.write_bytes(src.read_bytes())
 
 
+def _copy_file_to_dir(src: Path, dest_dir: Path, dest_name: str | None = None) -> None:
+    """Copy a file into a run directory, preserving name unless overridden."""
+    if not src.exists():
+        return
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    target = dest_dir / (dest_name if dest_name else src.name)
+    target.write_bytes(src.read_bytes())
+
+
 def _save_parquet_atomic(df: pd.DataFrame, path: Path) -> None:
     """Atomically save a parquet file to avoid partial writes."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1222,8 +1231,15 @@ def run_student_only(
     attempt_hash = _hash_file(ml_pred_path) if ml_pred_path.exists() else "missing"
     attempt_suffix = f"{timestamp}_{attempt_hash[:8]}"
     attempts_dir = (project_root / "results" / "attempts" / f"student_{freq.lower()}")
+    run_bucket = "oos_runs" if strict_oos_active else "student_runs"
+    run_mode = "oos" if strict_oos_active else "full"
+    run_dir = pipeline_results_dir / run_bucket / f"student_{run_mode}_{freq.lower()}_{attempt_suffix}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[Student] Run artifact dir: {run_dir}")
     _archive_file(ml_pred_path, attempts_dir, attempt_suffix)
     _archive_file(ml_model_path, attempts_dir, attempt_suffix)
+    _copy_file_to_dir(ml_pred_path, run_dir)
+    _copy_file_to_dir(ml_model_path, run_dir)
     print(f"[Student] Archived ML artifacts with id={attempt_suffix}")
 
     if limit_to_predicted_combos:
@@ -1386,6 +1402,10 @@ def run_student_only(
             student_results.to_csv(csv_path, index=False)
             print(f"[Student] ✓ Saved results to CSV: {csv_path}")
 
+    _copy_file_to_dir(student_path, run_dir)
+    _copy_file_to_dir(student_path.with_suffix(".csv"), run_dir)
+    _copy_file_to_dir(student_path.with_suffix(".txt"), run_dir)
+
     # STEP 3: Generate Student ranking
     print("\n" + "="*80)
     print("GENERATING STUDENT RANKING")
@@ -1405,6 +1425,7 @@ def run_student_only(
     student_ranking_path = pipeline_results_dir / f"student_ranking_{freq.lower()}.csv"
     student_ranking_public.to_csv(student_ranking_path, index=False)
     print(f"[Student] Saved ranking to {student_ranking_path}")
+    _copy_file_to_dir(student_ranking_path, run_dir)
 
     # Display top 10
     print(f"\nTOP 10 STUDENT PORTFOLIOS ({freq}):")
@@ -1440,6 +1461,7 @@ def run_student_only(
     with open(winner_path, 'w') as f:
         json.dump(student_winner_data, f, indent=2)
     print(f"[Student] Saved winner to {winner_path}")
+    _copy_file_to_dir(winner_path, run_dir)
 
     # Archive ranking + winner with the same attempt suffix
     _archive_file(student_ranking_path, attempts_dir, attempt_suffix)
@@ -1462,6 +1484,7 @@ def run_student_only(
             oos_ranking_path = pipeline_results_dir / f"student_ranking_oos_{freq.lower()}.csv"
             oos_ranking_public.to_csv(oos_ranking_path, index=False)
             print(f"[Student] Saved strict OOS ranking to {oos_ranking_path}")
+            _copy_file_to_dir(oos_ranking_path, run_dir)
 
             oos_winner = oos_ranking_public.iloc[0]
             oos_winner_data = {
@@ -1479,6 +1502,7 @@ def run_student_only(
             with open(oos_winner_path, 'w') as f:
                 json.dump(oos_winner_data, f, indent=2)
             print(f"[Student] Saved strict OOS winner to {oos_winner_path}")
+            _copy_file_to_dir(oos_winner_path, run_dir)
 
             teacher_grouped = oos_teacher.groupby(['combo', 'model'])['net_return'].agg(['mean', 'std', 'count'])
             daily_sharpe = teacher_grouped['mean'] / (teacher_grouped['std'] + 1e-10)
@@ -1522,6 +1546,7 @@ def run_student_only(
             with open(comparison_oos_path, 'w') as f:
                 json.dump(comparison_oos, f, indent=2)
             print(f"[Student] Saved strict OOS comparison to {comparison_oos_path}")
+            _copy_file_to_dir(comparison_oos_path, run_dir)
 
     # STEP 4: Compare Teacher vs Student
     print("\n" + "="*80)
@@ -1557,6 +1582,27 @@ def run_student_only(
     with open(comparison_path, 'w') as f:
         json.dump(comparison_data, f, indent=2)
     print(f"\nSaved comparison to {comparison_path}")
+    _copy_file_to_dir(comparison_path, run_dir)
+
+    run_meta = {
+        "created_at_utc": dt.datetime.utcnow().isoformat() + "Z",
+        "freq": freq,
+        "mode": "strict_oos" if strict_oos_active else "standard",
+        "oos_split": split_ratio if strict_oos_active else 0.0,
+        "cutoff": str(cutoff_ts) if cutoff_ts is not None else None,
+        "top_combos": top_combos_value,
+        "top_k_teachers": top_k_teachers,
+        "model_choice": model_choice,
+        "xgb_multi_output": bool(xgb_multi_output),
+        "ml_onfly": bool(ml_onfly),
+        "model_list": [str(m).upper() for m in model_list],
+        "run_signature": run_signature,
+        "attempt_suffix": attempt_suffix,
+    }
+    run_meta_path = run_dir / "run_meta.json"
+    with open(run_meta_path, "w") as f:
+        json.dump(run_meta, f, indent=2)
+    print(f"[Student] Saved run metadata to {run_meta_path}")
 
     print("\n✅ Student training and evaluation complete!")
 
