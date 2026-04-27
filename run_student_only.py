@@ -12,6 +12,7 @@ import warnings
 from collections import defaultdict
 import hashlib
 import datetime as dt
+import math
 
 # Suppress cvxpy and sklearn warnings
 warnings.filterwarnings('ignore', category=UserWarning, module='cvxpy')
@@ -128,6 +129,14 @@ def _archive_file(src: Path, dest_dir: Path, stem_suffix: str) -> None:
     dest.write_bytes(src.read_bytes())
 
 
+def _save_parquet_atomic(df: pd.DataFrame, path: Path) -> None:
+    """Atomically save a parquet file to avoid partial writes."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    df.to_parquet(tmp_path, index=False)
+    tmp_path.replace(path)
+
+
 def _combo_to_str(combo) -> str:
     """Normalize combo representations into the backtest label format."""
     if isinstance(combo, dict):
@@ -138,6 +147,143 @@ def _combo_to_str(combo) -> str:
     if isinstance(combo, (list, tuple)):
         return "_".join(str(item) for item in combo)
     return str(combo)
+
+
+def _prepare_student_public_ranking(ranking_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build a student-facing ranking table without the optimizer model label.
+
+    If multiple model labels exist for the same combo, keep the highest-sharpe row
+    for that combo and drop the `model` column.
+    """
+    if ranking_df is None or ranking_df.empty:
+        return pd.DataFrame(columns=["combo", "mean", "std", "count", "sharpe", "annualized_return", "volatility"])
+
+    ranking = ranking_df.copy()
+    if "sharpe" in ranking.columns:
+        ranking = ranking.sort_values("sharpe", ascending=False)
+    if "model" in ranking.columns:
+        ranking = ranking.drop_duplicates(subset=["combo"], keep="first")
+        ranking = ranking.drop(columns=["model"], errors="ignore")
+    return ranking.reset_index(drop=True)
+
+
+def _annualized_sharpe(returns: np.ndarray, periods_per_year: int = 365) -> float:
+    """Compute annualized Sharpe ratio from a 1D return array."""
+    if returns.size == 0:
+        return float("nan")
+    mu = float(np.mean(returns))
+    sigma = float(np.std(returns, ddof=1)) if returns.size > 1 else 0.0
+    if sigma <= 1e-12:
+        return float("nan")
+    return float(mu / sigma * np.sqrt(periods_per_year))
+
+
+def _circular_block_indices(
+    n: int,
+    block_size: int,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Sample n indices using circular block bootstrap."""
+    if n <= 0:
+        return np.array([], dtype=np.int64)
+    if block_size <= 1:
+        return rng.integers(0, n, size=n, dtype=np.int64)
+
+    num_blocks = int(math.ceil(n / block_size))
+    starts = rng.integers(0, n, size=num_blocks, dtype=np.int64)
+    idx = np.empty(num_blocks * block_size, dtype=np.int64)
+    cursor = 0
+    for start in starts:
+        block = (start + np.arange(block_size, dtype=np.int64)) % n
+        idx[cursor:cursor + block_size] = block
+        cursor += block_size
+    return idx[:n]
+
+
+def _compute_paired_bootstrap_significance(
+    aligned_df: pd.DataFrame,
+    n_bootstrap: int = 10_000,
+    block_size: int = 5,
+    seed: int = 42,
+) -> dict:
+    """
+    Compute paired bootstrap statistics on aligned teacher/student returns.
+
+    Parameters
+    ----------
+    aligned_df : pd.DataFrame
+        DataFrame with columns ['student', 'teacher'] and aligned timestamps.
+    """
+    if aligned_df.empty:
+        return {
+            "status": "insufficient_data",
+            "reason": "no aligned timestamps",
+            "n_obs": 0,
+        }
+
+    use_df = aligned_df.dropna(subset=["student", "teacher"]).copy()
+    n = int(len(use_df))
+    if n < 3:
+        return {
+            "status": "insufficient_data",
+            "reason": "fewer than 3 aligned observations",
+            "n_obs": n,
+        }
+
+    student_vals = use_df["student"].to_numpy(dtype=float, copy=False)
+    teacher_vals = use_df["teacher"].to_numpy(dtype=float, copy=False)
+    delta_vals = student_vals - teacher_vals
+
+    observed_mean_diff = float(np.mean(delta_vals))
+    observed_sharpe_diff = float(
+        _annualized_sharpe(student_vals) - _annualized_sharpe(teacher_vals)
+    )
+
+    reps = max(int(n_bootstrap), 100)
+    bsize = max(int(block_size), 1)
+    rng = np.random.default_rng(int(seed))
+
+    boot_mean = np.empty(reps, dtype=float)
+    boot_sharpe = np.empty(reps, dtype=float)
+
+    for i in range(reps):
+        idx = _circular_block_indices(n=n, block_size=bsize, rng=rng)
+        s_samp = student_vals[idx]
+        t_samp = teacher_vals[idx]
+        d_samp = s_samp - t_samp
+        boot_mean[i] = float(np.mean(d_samp))
+        boot_sharpe[i] = float(_annualized_sharpe(s_samp) - _annualized_sharpe(t_samp))
+
+    ci_mean = np.percentile(boot_mean, [2.5, 97.5]).tolist()
+    ci_sharpe = np.percentile(boot_sharpe, [2.5, 97.5]).tolist()
+
+    p_mean = float(min(1.0, 2.0 * min(np.mean(boot_mean <= 0.0), np.mean(boot_mean >= 0.0))))
+    finite_sharpe = boot_sharpe[np.isfinite(boot_sharpe)]
+    if finite_sharpe.size > 0:
+        p_sharpe = float(min(1.0, 2.0 * min(np.mean(finite_sharpe <= 0.0), np.mean(finite_sharpe >= 0.0))))
+    else:
+        p_sharpe = float("nan")
+
+    return {
+        "status": "ok",
+        "n_obs": n,
+        "bootstrap_samples": reps,
+        "block_size": bsize,
+        "seed": int(seed),
+        "observed": {
+            "mean_diff": observed_mean_diff,
+            "sharpe_diff": observed_sharpe_diff,
+        },
+        "ci95": {
+            "mean_diff": [float(ci_mean[0]), float(ci_mean[1])],
+            "sharpe_diff": [float(ci_sharpe[0]), float(ci_sharpe[1])],
+        },
+        "p_value": {
+            "mean_diff_two_sided": p_mean,
+            "sharpe_diff_two_sided": p_sharpe,
+        },
+    }
 
 
 def _top_combo_labels_from_ranking(
@@ -180,6 +326,39 @@ def _top_combo_labels_from_ranking(
     return labels
 
 
+def _top_combo_labels_from_teacher_slice(
+    teacher_slice: pd.DataFrame,
+    top_combos: int,
+) -> list[str]:
+    """
+    Select top-N combo labels using only the provided time slice.
+
+    This is used by walk-forward folds to avoid global ranking leakage.
+    """
+    if top_combos <= 0 or teacher_slice.empty:
+        return []
+    required = {"combo", "model", "net_return"}
+    if not required.issubset(set(teacher_slice.columns)):
+        return []
+
+    grouped = teacher_slice.groupby(["combo", "model"])["net_return"].agg(["mean", "std", "count"])
+    grouped = grouped[grouped["count"] >= 2]
+    if grouped.empty:
+        grouped = teacher_slice.groupby(["combo", "model"])["net_return"].agg(["mean", "std", "count"])
+    grouped["std"] = grouped["std"].fillna(0.0)
+    daily_sharpe = grouped["mean"] / (grouped["std"] + 1e-10)
+    grouped["sharpe"] = daily_sharpe * np.sqrt(365)
+    ranking = grouped.sort_values("sharpe", ascending=False).reset_index()
+
+    labels: list[str] = []
+    for combo in ranking["combo"].astype(str):
+        if combo not in labels:
+            labels.append(combo)
+        if len(labels) >= top_combos:
+            break
+    return labels
+
+
 def _load_teacher_results_filtered(
     teacher_path: Path,
     combo_filter: set[str] | None = None,
@@ -214,15 +393,32 @@ def _load_teacher_results_multi_source(
     combo_filter: set[str] | None = None,
 ) -> pd.DataFrame:
     """
-    Load teacher results from available sources, preferring checkpoints (base+delta) when present.
+    Load teacher results from available sources.
+
+    Preference order:
+    1) consolidated pipeline parquet (teacher_<freq>.parquet)
+    2) teacher checkpoint base
+    3) teacher checkpoint delta
+
+    This avoids inheriting stale/partial checkpoint rows when a clean consolidated
+    teacher parquet already exists.
     """
+    # Fast path: if consolidated teacher parquet exists, use it as a single source.
+    # This avoids expensive concat of multiple huge dataframes.
+    if pipeline_teacher_path.exists():
+        try:
+            part = _load_teacher_results_filtered(pipeline_teacher_path, combo_filter=combo_filter)
+            if not part.empty:
+                return part
+        except Exception as exc:
+            print(f"[Student-Only] Warning: failed to load pipeline teacher source {pipeline_teacher_path}: {exc}")
+
+    # Fallback path: load checkpoints (base + delta) and merge only if needed.
     sources: list[Path] = []
     if checkpoint_base_path.exists():
         sources.append(checkpoint_base_path)
     if checkpoint_delta_path.exists():
         sources.append(checkpoint_delta_path)
-    if not sources and pipeline_teacher_path.exists():
-        sources.append(pipeline_teacher_path)
 
     if not sources:
         return pd.DataFrame()
@@ -238,6 +434,8 @@ def _load_teacher_results_multi_source(
 
     if not frames:
         return pd.DataFrame()
+    if len(frames) == 1:
+        return frames[0]
 
     combined = pd.concat(frames, ignore_index=True)
     dedup_keys = [k for k in ("timestamp", "combo", "model") if k in combined.columns]
@@ -279,6 +477,55 @@ def _build_run_signature(
         "models": sorted(str(m).upper() for m in model_list),
         "combo_count": len(combo_labels),
         "combo_hash": combo_hash,
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _build_wf_signature(
+    freq: str,
+    model_list: list[str],
+    combos: list,
+    *,
+    top_combos: int | None,
+    top_k_teachers: int,
+    same_asset_count: bool,
+    n_lags: int,
+    noise_std: float,
+    noise_samples: int,
+    xgb_multi_output: bool,
+    softmax_temp: float,
+    wf_train_windows: int,
+    wf_test_windows: int,
+    wf_max_folds: int | None,
+    ml_onfly: bool,
+    use_ensemble: bool,
+    model_types: list[str],
+    dynamic_top_combos_wf: bool,
+) -> str:
+    combo_labels = sorted(_combo_to_str(combo) for combo in combos)
+    combo_hash = hashlib.sha256("\n".join(combo_labels).encode("utf-8")).hexdigest()
+    payload = {
+        "mode": "student_walk_forward",
+        "freq": str(freq).upper(),
+        "models": sorted(str(m).upper() for m in model_list),
+        "combo_count": len(combo_labels),
+        "combo_hash": combo_hash,
+        "top_combos": int(top_combos or 0),
+        "top_k_teachers": int(top_k_teachers),
+        "same_asset_count": bool(same_asset_count),
+        "n_lags": int(n_lags),
+        "noise_std": float(noise_std),
+        "noise_samples": int(noise_samples),
+        "xgb_multi_output": bool(xgb_multi_output),
+        "softmax_temp": float(softmax_temp),
+        "wf_train_windows": int(wf_train_windows),
+        "wf_test_windows": int(wf_test_windows),
+        "wf_max_folds": int(wf_max_folds) if wf_max_folds is not None else None,
+        "wf_version": "ml_onfly" if ml_onfly else "ml",
+        "use_ensemble": bool(use_ensemble),
+        "model_types": sorted(str(m).lower() for m in model_types),
+        "dynamic_top_combos_wf": bool(dynamic_top_combos_wf),
     }
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -374,10 +621,22 @@ def _run_student_walk_forward(
     noise_samples: int,
     xgb_multi_output: bool,
     softmax_temp: float,
+    top_combos: int | None,
     wf_train_windows: int,
     wf_test_windows: int,
     wf_max_folds: int | None,
+    ml_onfly: bool = False,
+    wf_min_count: int = 0,
+    wf_bootstrap: bool = True,
+    wf_bootstrap_samples: int = 10_000,
+    wf_bootstrap_block_size: int = 5,
+    wf_bootstrap_seed: int = 42,
+    wf_checkpoint_path: Path | None = None,
+    wf_signature: str | None = None,
+    enable_checkpoint: bool = True,
 ) -> None:
+    wf_version = "ml_onfly" if ml_onfly else "ml"
+    print(f"[WF] Backtest version: {wf_version}")
     timestamps = _get_rebalance_timestamps(freq, processed_dir)
     if len(timestamps) < wf_train_windows + wf_test_windows:
         print("[Student] Not enough rebalance windows for walk-forward")
@@ -387,8 +646,34 @@ def _run_student_walk_forward(
     if wf_max_folds:
         folds = folds[-wf_max_folds:]
 
+    wf_run_id = dt.datetime.utcnow().strftime("%Y%m%dT%H%M%S_%fZ")
+    wf_run_dir = pipeline_results_dir / "wf_runs" / f"student_wf_{freq.lower()}_{wf_run_id}"
+    wf_fold_dir = wf_run_dir / "folds"
+    wf_run_dir.mkdir(parents=True, exist_ok=True)
+    wf_fold_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[WF] Run artifact dir: {wf_run_dir}")
+
+    combo_entries = [(combo, _combo_to_str(combo)) for combo in combos]
     wf_results = []
+    completed_folds: set[int] = set()
+    if enable_checkpoint and wf_checkpoint_path is not None and wf_signature:
+        wf_checkpoint_df = _load_checkpoint(wf_checkpoint_path, expected_signature=wf_signature)
+        if not wf_checkpoint_df.empty:
+            wf_checkpoint_df = wf_checkpoint_df.drop(
+                columns=["_checkpoint_signature", "_checkpoint_saved_at"],
+                errors="ignore",
+            )
+            if "wf_fold" in wf_checkpoint_df.columns and "net_return" in wf_checkpoint_df.columns:
+                valid_cp = wf_checkpoint_df[wf_checkpoint_df["net_return"].notna()]
+                completed_folds = set(int(v) for v in valid_cp["wf_fold"].dropna().unique())
+            wf_results.append(wf_checkpoint_df)
+            print(f"[WF] Checkpoint loaded: {len(completed_folds)} completed folds")
+
     for fold_idx, i in enumerate(folds, 1):
+        if fold_idx in completed_folds:
+            print(f"\n[WF] Fold {fold_idx}/{len(folds)} already completed in checkpoint, skipping")
+            continue
+
         train_start = timestamps[i - wf_train_windows]
         train_end = timestamps[i - 1]
         test_start = timestamps[i]
@@ -405,8 +690,29 @@ def _run_student_walk_forward(
             print("[WF] Skipping fold: no teacher data")
             continue
 
+        fold_combos = combos
+        fold_train_subset = train_subset
+        if top_combos is not None and int(top_combos) > 0:
+            fold_top_labels = _top_combo_labels_from_teacher_slice(train_subset, int(top_combos))
+            if not fold_top_labels:
+                print("[WF] Skipping fold: top combo selection returned no labels")
+                continue
+            fold_top_set = set(fold_top_labels)
+            fold_combos = [combo for combo, label in combo_entries if label in fold_top_set]
+            if not fold_combos:
+                print("[WF] Skipping fold: no combo definitions matched selected labels")
+                continue
+            fold_train_subset = train_subset[train_subset["combo"].astype(str).isin(fold_top_set)]
+            if fold_train_subset.empty:
+                print("[WF] Skipping fold: selected top combos have no train rows")
+                continue
+            print(
+                f"[WF] Dynamic top-combo selection: {len(fold_combos)}/{len(combos)} "
+                f"combos from train-only ranking"
+            )
+
         ml_weights.train_weight_models(
-            teacher_results=train_subset,
+            teacher_results=fold_train_subset,
             processed_dir=processed_dir,
             freq=freq,
             use_ensemble=use_ensemble,
@@ -418,13 +724,14 @@ def _run_student_walk_forward(
             n_lags=n_lags,
             noise_std=noise_std,
             noise_samples=noise_samples,
+            generate_predictions=not ml_onfly,
         )
 
         fold_results = backtest_engine.run_backtest_parallel(
             freq=freq,
-            version="ml",
+            version=wf_version,
             model_list=model_list,
-            combo_iterable=combos,
+            combo_iterable=fold_combos,
             n_jobs=-1,
             start_ts=test_start,
             end_ts=test_end,
@@ -437,17 +744,50 @@ def _run_student_walk_forward(
             wf_train_end=train_end,
             wf_test_start=test_start,
             wf_test_end=test_end,
+            wf_combo_count=len(fold_combos),
         )
         wf_results.append(fold_results)
+        fold_file_name = f"fold_{fold_idx:03d}_{test_start.date()}_{test_end.date()}.parquet"
+        fold_path = wf_fold_dir / fold_file_name
+        _save_parquet_atomic(fold_results, fold_path)
+        print(f"[WF] Saved fold {fold_idx} results to {fold_path}")
+        if enable_checkpoint and wf_checkpoint_path is not None and wf_signature:
+            cp_df = pd.concat(wf_results, ignore_index=True)
+            cp_keys = [k for k in ("timestamp", "combo", "model", "wf_fold") if k in cp_df.columns]
+            if cp_keys:
+                cp_df = cp_df.drop_duplicates(subset=cp_keys, keep="last")
+            _save_checkpoint(cp_df, wf_checkpoint_path, signature=wf_signature)
 
     if not wf_results:
         print("[WF] No results generated")
         return
 
     student_results = pd.concat(wf_results, ignore_index=True)
+    student_results = student_results.drop(columns=["_checkpoint_signature", "_checkpoint_saved_at"], errors="ignore")
+    dedup_keys = [k for k in ("timestamp", "combo", "model", "wf_fold") if k in student_results.columns]
+    if dedup_keys:
+        student_results = student_results.drop_duplicates(subset=dedup_keys, keep="last")
     student_path = pipeline_results_dir / f"student_wf_{freq.lower()}.parquet"
     print(f"[WF] Saving {len(student_results)} results to {student_path}")
     _save_large_parquet(student_results, student_path)
+    student_run_path = wf_run_dir / f"student_wf_{freq.lower()}.parquet"
+    _save_large_parquet(student_results, student_run_path)
+    print(f"[WF] Saved run snapshot to {student_run_path}")
+
+    if "wf_fold" in student_results.columns:
+        grouped_folds = student_results.groupby("wf_fold", sort=True, dropna=True)
+        for fold_id, fold_df in grouped_folds:
+            try:
+                fold_idx = int(fold_id)
+            except (TypeError, ValueError):
+                continue
+            test_start = pd.to_datetime(fold_df["wf_test_start"].iloc[0]).date() if "wf_test_start" in fold_df.columns else "na"
+            test_end = pd.to_datetime(fold_df["wf_test_end"].iloc[0]).date() if "wf_test_end" in fold_df.columns else "na"
+            fold_file_name = f"fold_{fold_idx:03d}_{test_start}_{test_end}.parquet"
+            fold_path = wf_fold_dir / fold_file_name
+            if not fold_path.exists():
+                _save_parquet_atomic(fold_df, fold_path)
+                print(f"[WF] Saved checkpoint-restored fold {fold_idx} to {fold_path}")
 
     grouped = student_results.groupby(['combo', 'model'])['net_return'].agg(['mean', 'std', 'count'])
     daily_sharpe = grouped['mean'] / (grouped['std'] + 1e-10)
@@ -455,16 +795,49 @@ def _run_student_walk_forward(
     grouped['annualized_return'] = grouped['mean'] * 365
     grouped['volatility'] = grouped['std'] * np.sqrt(365)
 
-    ranking = grouped.sort_values('sharpe', ascending=False).reset_index()
-    ranking_path = pipeline_results_dir / f"student_ranking_wf_{freq.lower()}.csv"
-    ranking.to_csv(ranking_path, index=False)
-    print(f"[WF] Saved ranking to {ranking_path}")
+    ranking_all = grouped.sort_values('sharpe', ascending=False).reset_index()
+    ranking = ranking_all
+    min_count_requested = max(int(wf_min_count), 0)
+    min_count_applied = 0
+    if min_count_requested > 0 and "count" in ranking_all.columns:
+        ranking_filtered = ranking_all[ranking_all["count"] >= min_count_requested].copy()
+        if ranking_filtered.empty:
+            print(
+                f"[WF] min-count filter requested ({min_count_requested}) "
+                f"but no student rows matched; falling back to full ranking"
+            )
+        else:
+            ranking = ranking_filtered
+            min_count_applied = min_count_requested
+            print(
+                f"[WF] Applied student min-count filter: count >= {min_count_requested} "
+                f"({len(ranking)}/{len(ranking_all)} rows)"
+            )
+            ranking_public_filtered = _prepare_student_public_ranking(ranking)
+            ranking_filtered_path = (
+                pipeline_results_dir / f"student_ranking_wf_{freq.lower()}_mincount{min_count_requested}.csv"
+            )
+            ranking_public_filtered.to_csv(ranking_filtered_path, index=False)
+            print(f"[WF] Saved min-count ranking to {ranking_filtered_path}")
+            ranking_filtered_run_path = (
+                wf_run_dir / f"student_ranking_wf_{freq.lower()}_mincount{min_count_requested}.csv"
+            )
+            ranking_public_filtered.to_csv(ranking_filtered_run_path, index=False)
+            print(f"[WF] Saved run min-count ranking to {ranking_filtered_run_path}")
 
-    winner = ranking.iloc[0]
+    ranking_public_all = _prepare_student_public_ranking(ranking_all)
+    ranking_path = pipeline_results_dir / f"student_ranking_wf_{freq.lower()}.csv"
+    ranking_public_all.to_csv(ranking_path, index=False)
+    print(f"[WF] Saved ranking to {ranking_path}")
+    ranking_run_path = wf_run_dir / f"student_ranking_wf_{freq.lower()}.csv"
+    ranking_public_all.to_csv(ranking_run_path, index=False)
+    print(f"[WF] Saved run ranking to {ranking_run_path}")
+
+    ranking_public = _prepare_student_public_ranking(ranking)
+    winner = ranking_public.iloc[0]
     winner_data = {
         'freq': freq,
         'combo': winner['combo'],
-        'model': winner['model'],
         'sharpe': float(winner['sharpe']),
         'annualized_return': float(winner['annualized_return']),
         'volatility': float(winner['volatility']),
@@ -472,23 +845,50 @@ def _run_student_walk_forward(
         'walk_forward': True,
         'train_windows': wf_train_windows,
         'test_windows': wf_test_windows,
-        'folds': len(folds),
+        'folds': int(student_results["wf_fold"].nunique()) if "wf_fold" in student_results.columns else len(folds),
+        'target_folds': len(folds),
+        'wf_min_count_requested': min_count_requested,
+        'wf_min_count_applied': min_count_applied,
     }
     winner_path = pipeline_results_dir / f"winner_student_wf_{freq.lower()}.json"
     with open(winner_path, 'w') as f:
         json.dump(winner_data, f, indent=2)
     print(f"[WF] Saved winner to {winner_path}")
+    winner_run_path = wf_run_dir / f"winner_student_wf_{freq.lower()}.json"
+    with open(winner_run_path, "w") as f:
+        json.dump(winner_data, f, indent=2)
+    print(f"[WF] Saved run winner to {winner_run_path}")
 
     teacher_results = teacher_results.copy()
     teacher_results["timestamp"] = pd.to_datetime(teacher_results["timestamp"])
     oos_ts = student_results["timestamp"].unique()
-    teacher_oos = teacher_results[teacher_results["timestamp"].isin(oos_ts)]
+    oos_combo_set = set(student_results["combo"].astype(str).unique())
+    teacher_oos = teacher_results[
+        teacher_results["timestamp"].isin(oos_ts)
+        & teacher_results["combo"].astype(str).isin(oos_combo_set)
+    ]
     teacher_grouped = teacher_oos.groupby(['combo', 'model'])['net_return'].agg(['mean', 'std', 'count'])
     daily_sharpe = teacher_grouped['mean'] / (teacher_grouped['std'] + 1e-10)
     teacher_grouped['sharpe'] = daily_sharpe * np.sqrt(365)
     teacher_grouped['annualized_return'] = teacher_grouped['mean'] * 365
     teacher_grouped['volatility'] = teacher_grouped['std'] * np.sqrt(365)
-    teacher_ranking = teacher_grouped.sort_values('sharpe', ascending=False).reset_index()
+    teacher_ranking_all = teacher_grouped.sort_values('sharpe', ascending=False).reset_index()
+    teacher_ranking = teacher_ranking_all
+    teacher_min_count_applied = 0
+    if min_count_requested > 0 and "count" in teacher_ranking_all.columns:
+        teacher_filtered = teacher_ranking_all[teacher_ranking_all["count"] >= min_count_requested].copy()
+        if teacher_filtered.empty:
+            print(
+                f"[WF] min-count filter requested ({min_count_requested}) "
+                f"but no teacher rows matched; falling back to full teacher ranking"
+            )
+        else:
+            teacher_ranking = teacher_filtered
+            teacher_min_count_applied = min_count_requested
+            print(
+                f"[WF] Applied teacher min-count filter: count >= {min_count_requested} "
+                f"({len(teacher_ranking)}/{len(teacher_ranking_all)} rows)"
+            )
     teacher_winner = teacher_ranking.iloc[0]
 
     comparison = {
@@ -503,16 +903,65 @@ def _run_student_walk_forward(
         },
         'student': {
             'combo': winner['combo'],
-            'model': winner['model'],
             'sharpe': float(winner['sharpe']),
             'annualized_return': float(winner['annualized_return']),
             'volatility': float(winner['volatility']),
         },
+        'wf_min_count_requested': min_count_requested,
+        'wf_min_count_applied_student': min_count_applied,
+        'wf_min_count_applied_teacher': teacher_min_count_applied,
     }
     comparison_path = pipeline_results_dir / f"teacher_vs_student_wf_{freq.lower()}.json"
     with open(comparison_path, 'w') as f:
         json.dump(comparison, f, indent=2)
     print(f"[WF] Saved comparison to {comparison_path}")
+    comparison_run_path = wf_run_dir / f"teacher_vs_student_wf_{freq.lower()}.json"
+    with open(comparison_run_path, "w") as f:
+        json.dump(comparison, f, indent=2)
+    print(f"[WF] Saved run comparison to {comparison_run_path}")
+
+    if wf_bootstrap:
+        try:
+            student_series = (
+                student_results[student_results["combo"].astype(str) == str(winner["combo"])]
+                .groupby("timestamp", sort=True)["net_return"]
+                .mean()
+                .rename("student")
+            )
+            teacher_series = (
+                teacher_results[
+                    (teacher_results["combo"].astype(str) == str(teacher_winner["combo"]))
+                    & (teacher_results["model"].astype(str) == str(teacher_winner["model"]))
+                ]
+                .groupby("timestamp", sort=True)["net_return"]
+                .mean()
+                .rename("teacher")
+            )
+            paired = pd.concat([student_series, teacher_series], axis=1, join="inner").dropna()
+            sig = _compute_paired_bootstrap_significance(
+                paired,
+                n_bootstrap=wf_bootstrap_samples,
+                block_size=wf_bootstrap_block_size,
+                seed=wf_bootstrap_seed,
+            )
+            sig_payload = {
+                "freq": freq,
+                "walk_forward": True,
+                "student_combo": str(winner["combo"]),
+                "teacher_combo": str(teacher_winner["combo"]),
+                "teacher_model": str(teacher_winner["model"]),
+                "result": sig,
+            }
+            sig_path = pipeline_results_dir / f"significance_teacher_vs_student_wf_{freq.lower()}.json"
+            with open(sig_path, "w") as f:
+                json.dump(sig_payload, f, indent=2)
+            sig_run_path = wf_run_dir / f"significance_teacher_vs_student_wf_{freq.lower()}.json"
+            with open(sig_run_path, "w") as f:
+                json.dump(sig_payload, f, indent=2)
+            print(f"[WF] Saved bootstrap significance to {sig_path}")
+            print(f"[WF] Saved run bootstrap significance to {sig_run_path}")
+        except Exception as exc:
+            warnings.warn(f"[WF] Failed to compute bootstrap significance: {exc}")
 
 
 def run_student_only(
@@ -538,6 +987,11 @@ def run_student_only(
     wf_train_windows=None,
     wf_test_windows=None,
     wf_max_folds=None,
+    wf_min_count=0,
+    wf_bootstrap=True,
+    wf_bootstrap_samples=10000,
+    wf_bootstrap_block_size=5,
+    wf_bootstrap_seed=42,
 ):
     """
     Train and evaluate Student models using pre-computed Teacher results.
@@ -563,24 +1017,32 @@ def run_student_only(
         print("[Error] Please run teacher pipeline first.")
         return
 
+    top_combos_value = max(int(top_combos), 0) if top_combos is not None else 0
+    dynamic_top_combos_wf = bool(walk_forward and top_combos_value > 0)
+    if dynamic_top_combos_wf:
+        print(
+            f"[Student-Only] Walk-forward dynamic top-combo mode enabled "
+            f"(top={top_combos_value}, selected per fold from train history)"
+        )
+
     preselected_top_labels: list[str] = []
-    if top_combos is not None and int(top_combos) > 0:
+    if top_combos_value > 0 and not dynamic_top_combos_wf:
         preselected_top_labels = _top_combo_labels_from_ranking(
             pipeline_results_dir=pipeline_results_dir,
             freq=freq,
-            top_combos=max(int(top_combos), 0),
+            top_combos=top_combos_value,
             teacher_results=None,
         )
         if preselected_top_labels:
             print(f"[Student-Only] Preselected {len(preselected_top_labels)} top combos from teacher ranking")
 
     source_desc = []
+    if teacher_path.exists():
+        source_desc.append(str(teacher_path))
     if checkpoint_teacher_base.exists():
         source_desc.append(str(checkpoint_teacher_base))
     if checkpoint_teacher_delta.exists():
         source_desc.append(str(checkpoint_teacher_delta))
-    if not source_desc:
-        source_desc.append(str(teacher_path))
     print(f"[Student-Only] Loading teacher results from: {', '.join(source_desc)}")
     combo_filter_set = set(preselected_top_labels) if preselected_top_labels else None
     teacher_results = _load_teacher_results_multi_source(
@@ -606,20 +1068,19 @@ def run_student_only(
     if combo_limit is not None:
         combos = combos[:max(combo_limit, 0)]
 
-    if top_combos is not None:
-        top_combos = max(int(top_combos), 0)
-        if top_combos > 0:
+    if top_combos_value > 0 and not dynamic_top_combos_wf:
+        if top_combos_value > 0:
             top_labels = preselected_top_labels or _top_combo_labels_from_ranking(
                 pipeline_results_dir=pipeline_results_dir,
                 freq=freq,
-                top_combos=top_combos,
+                top_combos=top_combos_value,
                 teacher_results=teacher_results,
             )
             top_label_set = set(top_labels)
             combos_before = len(combos)
             combos = [c for c in combos if _combo_to_str(c) in top_label_set]
             print(
-                f"[Student-Only] Applied top combo filter: top {top_combos} "
+                f"[Student-Only] Applied top combo filter: top {top_combos_value} "
                 f"teacher combos -> {len(combos)}/{combos_before} combinations"
             )
 
@@ -648,16 +1109,12 @@ def run_student_only(
         wf_cfg = cfg.get("ml", {}).get("walk_forward", {})
         wf_train_windows = wf_train_windows or int(wf_cfg.get("train_windows", 60))
         wf_test_windows = wf_test_windows or int(wf_cfg.get("test_windows", 1))
-        _run_student_walk_forward(
-            teacher_results=teacher_results,
-            combos=combos,
+        model_list_effective = [m.upper() for m in (model_list or ["MV", "MVSK", "MCVaRSK"])]
+        wf_signature = _build_wf_signature(
             freq=freq,
-            processed_dir=processed_dir,
-            pipeline_results_dir=pipeline_results_dir,
-            model_list=model_list or ["MV", "MVSK", "MCVaRSK"],
-            use_ensemble=use_ensemble,
-            model_types=model_types,
-            label=label,
+            model_list=model_list_effective,
+            combos=combos,
+            top_combos=top_combos_value if dynamic_top_combos_wf else None,
             top_k_teachers=top_k_teachers,
             same_asset_count=same_asset_count,
             n_lags=n_lags,
@@ -668,6 +1125,42 @@ def run_student_only(
             wf_train_windows=wf_train_windows,
             wf_test_windows=wf_test_windows,
             wf_max_folds=wf_max_folds,
+            ml_onfly=ml_onfly,
+            use_ensemble=use_ensemble,
+            model_types=model_types,
+            dynamic_top_combos_wf=dynamic_top_combos_wf,
+        )
+        wf_checkpoint_path = checkpoints_dir / f"checkpoint_student_wf_{freq.lower()}.parquet"
+        _run_student_walk_forward(
+            teacher_results=teacher_results,
+            combos=combos,
+            freq=freq,
+            processed_dir=processed_dir,
+            pipeline_results_dir=pipeline_results_dir,
+            model_list=model_list_effective,
+            use_ensemble=use_ensemble,
+            model_types=model_types,
+            label=label,
+            top_k_teachers=top_k_teachers,
+            same_asset_count=same_asset_count,
+            n_lags=n_lags,
+            noise_std=noise_std,
+            noise_samples=noise_samples,
+            xgb_multi_output=xgb_multi_output,
+            softmax_temp=softmax_temp,
+            top_combos=top_combos_value if dynamic_top_combos_wf else None,
+            wf_train_windows=wf_train_windows,
+            wf_test_windows=wf_test_windows,
+            wf_max_folds=wf_max_folds,
+            ml_onfly=ml_onfly,
+            wf_min_count=wf_min_count,
+            wf_bootstrap=wf_bootstrap,
+            wf_bootstrap_samples=wf_bootstrap_samples,
+            wf_bootstrap_block_size=wf_bootstrap_block_size,
+            wf_bootstrap_seed=wf_bootstrap_seed,
+            wf_checkpoint_path=wf_checkpoint_path,
+            wf_signature=wf_signature,
+            enable_checkpoint=not disable_checkpoint,
         )
         return
 
@@ -864,26 +1357,26 @@ def run_student_only(
     student_grouped['volatility'] = student_grouped['std'] * np.sqrt(365)
 
     student_ranking = student_grouped.sort_values('sharpe', ascending=False).reset_index()
+    student_ranking_public = _prepare_student_public_ranking(student_ranking)
 
     # Save student ranking
     student_ranking_path = pipeline_results_dir / f"student_ranking_{freq.lower()}.csv"
-    student_ranking.to_csv(student_ranking_path, index=False)
+    student_ranking_public.to_csv(student_ranking_path, index=False)
     print(f"[Student] Saved ranking to {student_ranking_path}")
 
     # Display top 10
     print(f"\nTOP 10 STUDENT PORTFOLIOS ({freq}):")
-    print("="*100)
-    print(f"{'Rank':<6}{'Combo':<35}{'Model':<10}{'Sharpe':<10}{'Return':<12}{'Vol':<10}")
-    print("-"*100)
-    for idx, row in student_ranking.head(10).iterrows():
-        print(f"{idx+1:<6}{row['combo'][:34]:<35}{row['model']:<10}{row['sharpe']:<10.4f}{row['annualized_return']:<12.2%}{row['volatility']:<10.2%}")
-    print("="*100)
+    print("="*90)
+    print(f"{'Rank':<6}{'Combo':<35}{'Sharpe':<10}{'Return':<12}{'Vol':<10}")
+    print("-"*90)
+    for idx, row in student_ranking_public.head(10).iterrows():
+        print(f"{idx+1:<6}{row['combo'][:34]:<35}{row['sharpe']:<10.4f}{row['annualized_return']:<12.2%}{row['volatility']:<10.2%}")
+    print("="*90)
 
     # Student winner
-    student_winner = student_ranking.iloc[0]
+    student_winner = student_ranking_public.iloc[0]
     print(f"\nSTUDENT WINNER ({freq}):")
     print(f"   Combo: {student_winner['combo']}")
-    print(f"   Model: {student_winner['model']}")
     print(f"   Sharpe: {student_winner['sharpe']:.4f}")
     print(f"   Annual Return: {student_winner['annualized_return']:.2%}")
     print(f"   Volatility: {student_winner['volatility']:.2%}")
@@ -892,7 +1385,6 @@ def run_student_only(
     student_winner_data = {
         'freq': freq,
         'combo': student_winner['combo'],
-        'model': student_winner['model'],
         'sharpe': float(student_winner['sharpe']),
         'annualized_return': float(student_winner['annualized_return']),
         'volatility': float(student_winner['volatility']),
@@ -929,16 +1421,16 @@ def run_student_only(
             oos_grouped['annualized_return'] = oos_grouped['mean'] * 365
             oos_grouped['volatility'] = oos_grouped['std'] * np.sqrt(365)
             oos_ranking = oos_grouped.sort_values('sharpe', ascending=False).reset_index()
+            oos_ranking_public = _prepare_student_public_ranking(oos_ranking)
 
             oos_ranking_path = pipeline_results_dir / f"student_ranking_oos_{freq.lower()}.csv"
-            oos_ranking.to_csv(oos_ranking_path, index=False)
+            oos_ranking_public.to_csv(oos_ranking_path, index=False)
             print(f"[Student] Saved OOS ranking to {oos_ranking_path}")
 
-            oos_winner = oos_ranking.iloc[0]
+            oos_winner = oos_ranking_public.iloc[0]
             oos_winner_data = {
                 'freq': freq,
                 'combo': oos_winner['combo'],
-                'model': oos_winner['model'],
                 'sharpe': float(oos_winner['sharpe']),
                 'annualized_return': float(oos_winner['annualized_return']),
                 'volatility': float(oos_winner['volatility']),
@@ -972,7 +1464,6 @@ def run_student_only(
                 },
                 'student': {
                     'combo': oos_winner['combo'],
-                    'model': oos_winner['model'],
                     'sharpe': float(oos_winner['sharpe']),
                     'annualized_return': float(oos_winner['annualized_return']),
                     'volatility': float(oos_winner['volatility']),
@@ -1147,6 +1638,35 @@ if __name__ == "__main__":
         default=None,
         help="Limit number of walk-forward folds (use last N).",
     )
+    parser.add_argument(
+        "--wf-min-count",
+        type=int,
+        default=0,
+        help="Optional minimum count filter for WF ranking/winner selection (0 disables).",
+    )
+    parser.add_argument(
+        "--no-wf-bootstrap",
+        action="store_true",
+        help="Disable paired block-bootstrap significance analysis for WF comparison outputs.",
+    )
+    parser.add_argument(
+        "--wf-bootstrap-samples",
+        type=int,
+        default=10000,
+        help="Number of bootstrap resamples for WF significance analysis.",
+    )
+    parser.add_argument(
+        "--wf-bootstrap-block-size",
+        type=int,
+        default=5,
+        help="Circular block size for WF bootstrap significance.",
+    )
+    parser.add_argument(
+        "--wf-bootstrap-seed",
+        type=int,
+        default=42,
+        help="Random seed for WF bootstrap significance.",
+    )
     args = parser.parse_args()
 
     for freq in args.freqs:
@@ -1177,4 +1697,9 @@ if __name__ == "__main__":
             wf_train_windows=args.wf_train_windows,
             wf_test_windows=args.wf_test_windows,
             wf_max_folds=args.wf_max_folds,
+            wf_min_count=args.wf_min_count,
+            wf_bootstrap=not args.no_wf_bootstrap,
+            wf_bootstrap_samples=args.wf_bootstrap_samples,
+            wf_bootstrap_block_size=args.wf_bootstrap_block_size,
+            wf_bootstrap_seed=args.wf_bootstrap_seed,
         )

@@ -4,6 +4,7 @@ Backtesting engine for rolling portfolio optimization and rebalancing analysis.
 
 from __future__ import annotations
 
+import bisect
 import copy
 import warnings
 from dataclasses import dataclass
@@ -81,6 +82,7 @@ def _unpack_task(args: Tuple) -> Tuple:
             state["ml_weights_df"],
             state["index_common"],
             state["rebalance_positions"],
+            state["all_rebalance_positions"],
             state["cfg_bt"],
             state["cfg"],
             state["asset_list_all"],
@@ -362,6 +364,16 @@ def _rebalance_positions(index: pd.DatetimeIndex, cfg: BacktestConfig) -> List[i
             positions.insert(0, cfg.window - 1)
         positions = sorted(set(pos for pos in positions if pos < len(index)))
     return positions
+
+
+def _next_rebalance_position(start_pos: int, all_positions: Sequence[int]) -> Optional[int]:
+    """
+    Get the next rebalance boundary after ``start_pos`` from the full schedule.
+    """
+    idx = bisect.bisect_right(all_positions, int(start_pos))
+    if idx < len(all_positions):
+        return int(all_positions[idx])
+    return None
 
 
 def _sanitize_weights(weights: np.ndarray) -> np.ndarray:
@@ -671,9 +683,10 @@ def run_backtest(
     else:
         index_common = simple_returns.index
 
-    rebalance_positions = _rebalance_positions(index_common, cfg_bt)
-    if not rebalance_positions:
+    all_rebalance_positions = _rebalance_positions(index_common, cfg_bt)
+    if not all_rebalance_positions:
         raise ValueError("No rebalance positions were generated; check window and data alignment.")
+    rebalance_positions = list(all_rebalance_positions)
 
     if start_ts is not None or end_ts is not None:
         start_ts = pd.Timestamp(start_ts) if start_ts is not None else None
@@ -687,6 +700,8 @@ def run_backtest(
                 continue
             filtered_positions.append(pos)
         rebalance_positions = filtered_positions
+    if not rebalance_positions:
+        return pd.DataFrame()
 
     all_runs: List[pd.DataFrame] = []
     project_root = Path(__file__).resolve().parents[1]
@@ -731,7 +746,8 @@ def run_backtest(
 
             for pos_idx, start_pos in enumerate(rebalance_positions):
                 ts = index_common[start_pos]
-                end_pos = rebalance_positions[pos_idx + 1] if pos_idx + 1 < len(rebalance_positions) else len(index_common)
+                next_pos = _next_rebalance_position(start_pos, all_rebalance_positions)
+                end_pos = next_pos if next_pos is not None else len(index_common)
                 period_index = index_common[start_pos:end_pos]
 
                 use_ml_weights = False
@@ -950,7 +966,7 @@ def _process_single_combo_model(args: Tuple) -> Optional[pd.DataFrame]:
     args = _unpack_task(args)
     (
         combo, model_name, freq_norm, version_norm, returns_df, baseline_panels,
-        forecast_panels, ml_weights_df, index_common, rebalance_positions, cfg_bt,
+        forecast_panels, ml_weights_df, index_common, rebalance_positions, all_rebalance_positions, cfg_bt,
         cfg, asset_list_all, results_root, freq_suffix, ml_models_dict, ml_features_df
     ) = args
 
@@ -981,7 +997,8 @@ def _process_single_combo_model(args: Tuple) -> Optional[pd.DataFrame]:
 
         for pos_idx, start_pos in enumerate(rebalance_positions):
             ts = index_common[start_pos]
-            end_pos = rebalance_positions[pos_idx + 1] if pos_idx + 1 < len(rebalance_positions) else len(index_common)
+            next_pos = _next_rebalance_position(start_pos, all_rebalance_positions)
+            end_pos = next_pos if next_pos is not None else len(index_common)
             period_index = index_common[start_pos:end_pos]
 
             use_ml_weights = False
@@ -1208,9 +1225,10 @@ def run_backtest_parallel(
     else:
         index_common = returns_df.index
 
-    rebalance_positions = _rebalance_positions(index_common, cfg_bt)
-    if not rebalance_positions:
+    all_rebalance_positions = _rebalance_positions(index_common, cfg_bt)
+    if not all_rebalance_positions:
         raise ValueError("No rebalance positions were generated; check window and data alignment.")
+    rebalance_positions = list(all_rebalance_positions)
     if start_ts is not None or end_ts is not None:
         start_ts = pd.Timestamp(start_ts) if start_ts is not None else None
         end_ts = pd.Timestamp(end_ts) if end_ts is not None else None
@@ -1219,6 +1237,8 @@ def run_backtest_parallel(
             if (start_ts is None or index_common[pos] >= start_ts)
             and (end_ts is None or index_common[pos] <= end_ts)
         ]
+    if not rebalance_positions:
+        return pd.DataFrame()
 
     project_root = Path(__file__).resolve().parents[1]
     results_root = project_root / "results" / "runs"
@@ -1247,7 +1267,7 @@ def run_backtest_parallel(
             else:
                 task_args = (
                     combo, model_name, freq_norm, version_norm, returns_df, baseline_panels,
-                    forecast_panels, ml_weights_df, index_common, rebalance_positions, cfg_bt,
+                    forecast_panels, ml_weights_df, index_common, rebalance_positions, all_rebalance_positions, cfg_bt,
                     cfg, asset_list_all, results_root, freq_suffix, ml_models_dict, ml_features_df
                 )
             tasks.append(task_args)
@@ -1275,6 +1295,7 @@ def run_backtest_parallel(
             "ml_weights_df": ml_weights_df,
             "index_common": index_common,
             "rebalance_positions": rebalance_positions,
+            "all_rebalance_positions": all_rebalance_positions,
             "cfg_bt": cfg_bt,
             "cfg": cfg,
             "asset_list_all": asset_list_all,
