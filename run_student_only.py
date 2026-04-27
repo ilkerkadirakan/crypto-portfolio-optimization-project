@@ -291,6 +291,7 @@ def _top_combo_labels_from_ranking(
     freq: str,
     top_combos: int,
     teacher_results: pd.DataFrame | None = None,
+    use_ranking_csv: bool = True,
 ) -> list[str]:
     """Return top-N unique combo labels ordered by teacher ranking."""
     if top_combos <= 0:
@@ -299,7 +300,7 @@ def _top_combo_labels_from_ranking(
     ranking_path = pipeline_results_dir / f"teacher_ranking_{freq.lower()}.csv"
     labels: list[str] = []
 
-    if ranking_path.exists():
+    if use_ranking_csv and ranking_path.exists():
         ranking_df = pd.read_csv(ranking_path)
         if "combo" in ranking_df.columns:
             for combo in ranking_df["combo"].astype(str):
@@ -468,6 +469,11 @@ def _build_run_signature(
     version_flag: str,
     model_list: list[str],
     combos: list,
+    *,
+    backtest_start_ts: pd.Timestamp | None = None,
+    backtest_end_ts: pd.Timestamp | None = None,
+    oos_split: float | None = None,
+    strict_oos: bool = False,
 ) -> str:
     combo_labels = sorted(_combo_to_str(combo) for combo in combos)
     combo_hash = hashlib.sha256("\n".join(combo_labels).encode("utf-8")).hexdigest()
@@ -477,7 +483,14 @@ def _build_run_signature(
         "models": sorted(str(m).upper() for m in model_list),
         "combo_count": len(combo_labels),
         "combo_hash": combo_hash,
+        "strict_oos": bool(strict_oos),
     }
+    if backtest_start_ts is not None:
+        payload["backtest_start_ts"] = pd.Timestamp(backtest_start_ts).isoformat()
+    if backtest_end_ts is not None:
+        payload["backtest_end_ts"] = pd.Timestamp(backtest_end_ts).isoformat()
+    if oos_split is not None:
+        payload["oos_split"] = float(oos_split)
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
@@ -1025,17 +1038,6 @@ def run_student_only(
             f"(top={top_combos_value}, selected per fold from train history)"
         )
 
-    preselected_top_labels: list[str] = []
-    if top_combos_value > 0 and not dynamic_top_combos_wf:
-        preselected_top_labels = _top_combo_labels_from_ranking(
-            pipeline_results_dir=pipeline_results_dir,
-            freq=freq,
-            top_combos=top_combos_value,
-            teacher_results=None,
-        )
-        if preselected_top_labels:
-            print(f"[Student-Only] Preselected {len(preselected_top_labels)} top combos from teacher ranking")
-
     source_desc = []
     if teacher_path.exists():
         source_desc.append(str(teacher_path))
@@ -1044,16 +1046,42 @@ def run_student_only(
     if checkpoint_teacher_delta.exists():
         source_desc.append(str(checkpoint_teacher_delta))
     print(f"[Student-Only] Loading teacher results from: {', '.join(source_desc)}")
-    combo_filter_set = set(preselected_top_labels) if preselected_top_labels else None
     teacher_results = _load_teacher_results_multi_source(
         pipeline_teacher_path=teacher_path,
         checkpoint_base_path=checkpoint_teacher_base,
         checkpoint_delta_path=checkpoint_teacher_delta,
-        combo_filter=combo_filter_set,
+        combo_filter=None,
     )
     print(f"[Student-Only] Loaded {len(teacher_results)} teacher backtest rows")
     teacher_results = teacher_results.copy()
     teacher_results["timestamp"] = pd.to_datetime(teacher_results["timestamp"])
+
+    strict_oos_active = bool((not walk_forward) and oos_split and 0 < float(oos_split) < 1)
+    split_ratio = float(oos_split) if strict_oos_active else 0.0
+    cutoff_ts: pd.Timestamp | None = None
+    teacher_train_results = teacher_results
+    teacher_oos_results = pd.DataFrame(columns=teacher_results.columns)
+    if strict_oos_active:
+        unique_ts = pd.Index(teacher_results["timestamp"]).dropna().unique().sort_values()
+        if len(unique_ts) < 2:
+            print("[Error] Strict OOS split requires at least 2 unique timestamps.")
+            return
+        cutoff_idx = max(1, int(len(unique_ts) * (1 - split_ratio)))
+        cutoff_idx = min(cutoff_idx, len(unique_ts) - 1)
+        cutoff_ts = pd.Timestamp(unique_ts[cutoff_idx - 1])
+        teacher_train_results = teacher_results[teacher_results["timestamp"] <= cutoff_ts].copy()
+        teacher_oos_results = teacher_results[teacher_results["timestamp"] > cutoff_ts].copy()
+        if teacher_train_results.empty or teacher_oos_results.empty:
+            print(
+                f"[Error] Strict OOS split failed: train_rows={len(teacher_train_results)}, "
+                f"oos_rows={len(teacher_oos_results)}"
+            )
+            return
+        print(
+            f"[Student] Strict OOS enabled: split={split_ratio:.1%}, "
+            f"cutoff={cutoff_ts.date()}, train_rows={len(teacher_train_results)}, "
+            f"oos_rows={len(teacher_oos_results)}"
+        )
 
     # Load combinations
     combos_by_size = combination_utils.cache_combinations()
@@ -1069,20 +1097,21 @@ def run_student_only(
         combos = combos[:max(combo_limit, 0)]
 
     if top_combos_value > 0 and not dynamic_top_combos_wf:
-        if top_combos_value > 0:
-            top_labels = preselected_top_labels or _top_combo_labels_from_ranking(
-                pipeline_results_dir=pipeline_results_dir,
-                freq=freq,
-                top_combos=top_combos_value,
-                teacher_results=teacher_results,
-            )
-            top_label_set = set(top_labels)
-            combos_before = len(combos)
-            combos = [c for c in combos if _combo_to_str(c) in top_label_set]
-            print(
-                f"[Student-Only] Applied top combo filter: top {top_combos_value} "
-                f"teacher combos -> {len(combos)}/{combos_before} combinations"
-            )
+        top_labels = _top_combo_labels_from_ranking(
+            pipeline_results_dir=pipeline_results_dir,
+            freq=freq,
+            top_combos=top_combos_value,
+            teacher_results=teacher_train_results if strict_oos_active else teacher_results,
+            use_ranking_csv=not strict_oos_active,
+        )
+        top_label_set = set(top_labels)
+        combos_before = len(combos)
+        combos = [c for c in combos if _combo_to_str(c) in top_label_set]
+        source_label = "train-only teacher slice" if strict_oos_active else "teacher ranking"
+        print(
+            f"[Student-Only] Applied top combo filter: top {top_combos_value} "
+            f"({source_label}) -> {len(combos)}/{combos_before} combinations"
+        )
 
     print(f"[Student-Only] Found {len(combos)} portfolio combinations")
 
@@ -1171,7 +1200,7 @@ def run_student_only(
 
     print(f"[Student] Training ML {label} models to learn portfolio weights...")
     ml_weights.train_weight_models(
-        teacher_results=teacher_results,
+        teacher_results=teacher_train_results if strict_oos_active else teacher_results,
         processed_dir=processed_dir,
         freq=freq,
         use_ensemble=use_ensemble,
@@ -1214,11 +1243,22 @@ def run_student_only(
 
     model_list = model_list or ["MV", "MVSK", "MCVaRSK"]
     version_flag = "ml_onfly" if ml_onfly else "ml"
+    backtest_start_ts = pd.Timestamp(teacher_oos_results["timestamp"].min()) if strict_oos_active else None
+    backtest_end_ts = pd.Timestamp(teacher_oos_results["timestamp"].max()) if strict_oos_active else None
+    if strict_oos_active:
+        print(
+            f"[Student] Strict OOS backtest window: "
+            f"{backtest_start_ts.date()}..{backtest_end_ts.date()}"
+        )
     run_signature = _build_run_signature(
         freq=freq,
         version_flag=version_flag,
         model_list=model_list,
         combos=combos,
+        backtest_start_ts=backtest_start_ts,
+        backtest_end_ts=backtest_end_ts,
+        oos_split=split_ratio if strict_oos_active else None,
+        strict_oos=strict_oos_active,
     )
     results_root = project_root / "results"
 
@@ -1284,6 +1324,8 @@ def run_student_only(
                 model_list=model_list,
                 combo_iterable=batch_combos,
                 n_jobs=-1,
+                start_ts=backtest_start_ts,
+                end_ts=backtest_end_ts,
             )
 
             if not batch_results.empty:
@@ -1390,6 +1432,10 @@ def run_student_only(
         'volatility': float(student_winner['volatility']),
         'version': 'student'
     }
+    if strict_oos_active and cutoff_ts is not None:
+        student_winner_data['strict_oos'] = True
+        student_winner_data['cutoff'] = str(cutoff_ts)
+        student_winner_data['oos_split'] = split_ratio
     winner_path = pipeline_results_dir / f"winner_student_{freq.lower()}.json"
     with open(winner_path, 'w') as f:
         json.dump(student_winner_data, f, indent=2)
@@ -1399,22 +1445,12 @@ def run_student_only(
     _archive_file(student_ranking_path, attempts_dir, attempt_suffix)
     _archive_file(winner_path, attempts_dir, attempt_suffix)
 
-    # Optional holdout (OOS) evaluation on the tail of the sample
-    if oos_split and 0 < float(oos_split) < 1:
-        split_ratio = float(oos_split)
-        student_results = student_results.copy()
-        student_results["timestamp"] = pd.to_datetime(student_results["timestamp"])
-        teacher_results_local = teacher_results.copy()
-        teacher_results_local["timestamp"] = pd.to_datetime(teacher_results_local["timestamp"])
+    teacher_winner_data_override = None
+    if strict_oos_active and cutoff_ts is not None:
+        oos_student = student_results.copy()
+        oos_teacher = teacher_oos_results.copy()
 
-        unique_ts = pd.Index(student_results["timestamp"]).unique().sort_values()
-        cutoff_idx = max(1, int(len(unique_ts) * (1 - split_ratio)))
-        cutoff_ts = unique_ts[cutoff_idx - 1]
-
-        oos_student = student_results[student_results["timestamp"] > cutoff_ts]
-        oos_teacher = teacher_results_local[teacher_results_local["timestamp"] > cutoff_ts]
-
-        if not oos_student.empty:
+        if not oos_student.empty and not oos_teacher.empty:
             oos_grouped = oos_student.groupby(['combo', 'model'])['net_return'].agg(['mean', 'std', 'count'])
             daily_sharpe = oos_grouped['mean'] / (oos_grouped['std'] + 1e-10)
             oos_grouped['sharpe'] = daily_sharpe * np.sqrt(365)
@@ -1425,7 +1461,7 @@ def run_student_only(
 
             oos_ranking_path = pipeline_results_dir / f"student_ranking_oos_{freq.lower()}.csv"
             oos_ranking_public.to_csv(oos_ranking_path, index=False)
-            print(f"[Student] Saved OOS ranking to {oos_ranking_path}")
+            print(f"[Student] Saved strict OOS ranking to {oos_ranking_path}")
 
             oos_winner = oos_ranking_public.iloc[0]
             oos_winner_data = {
@@ -1435,13 +1471,14 @@ def run_student_only(
                 'annualized_return': float(oos_winner['annualized_return']),
                 'volatility': float(oos_winner['volatility']),
                 'version': 'student',
+                'strict_oos': True,
                 'cutoff': str(cutoff_ts),
                 'oos_split': split_ratio,
             }
             oos_winner_path = pipeline_results_dir / f"winner_student_oos_{freq.lower()}.json"
             with open(oos_winner_path, 'w') as f:
                 json.dump(oos_winner_data, f, indent=2)
-            print(f"[Student] Saved OOS winner to {oos_winner_path}")
+            print(f"[Student] Saved strict OOS winner to {oos_winner_path}")
 
             teacher_grouped = oos_teacher.groupby(['combo', 'model'])['net_return'].agg(['mean', 'std', 'count'])
             daily_sharpe = teacher_grouped['mean'] / (teacher_grouped['std'] + 1e-10)
@@ -1450,9 +1487,21 @@ def run_student_only(
             teacher_grouped['volatility'] = teacher_grouped['std'] * np.sqrt(365)
             teacher_ranking = teacher_grouped.sort_values('sharpe', ascending=False).reset_index()
             teacher_oos_winner = teacher_ranking.iloc[0]
+            teacher_winner_data_override = {
+                'freq': freq,
+                'combo': teacher_oos_winner['combo'],
+                'model': teacher_oos_winner['model'],
+                'sharpe': float(teacher_oos_winner['sharpe']),
+                'annualized_return': float(teacher_oos_winner['annualized_return']),
+                'volatility': float(teacher_oos_winner['volatility']),
+                'strict_oos': True,
+                'cutoff': str(cutoff_ts),
+                'oos_split': split_ratio,
+            }
 
             comparison_oos = {
                 'freq': freq,
+                'strict_oos': True,
                 'cutoff': str(cutoff_ts),
                 'oos_split': split_ratio,
                 'teacher': {
@@ -1472,17 +1521,19 @@ def run_student_only(
             comparison_oos_path = pipeline_results_dir / f"teacher_vs_student_oos_{freq.lower()}.json"
             with open(comparison_oos_path, 'w') as f:
                 json.dump(comparison_oos, f, indent=2)
-            print(f"[Student] Saved OOS comparison to {comparison_oos_path}")
+            print(f"[Student] Saved strict OOS comparison to {comparison_oos_path}")
 
     # STEP 4: Compare Teacher vs Student
     print("\n" + "="*80)
     print("TEACHER vs STUDENT COMPARISON")
     print("="*80)
 
-    # Load teacher winner
-    teacher_winner_path = pipeline_results_dir / f"winner_teacher_{freq.lower()}.json"
-    with open(teacher_winner_path, 'r') as f:
-        teacher_winner_data = json.load(f)
+    if teacher_winner_data_override is not None:
+        teacher_winner_data = teacher_winner_data_override
+    else:
+        teacher_winner_path = pipeline_results_dir / f"winner_teacher_{freq.lower()}.json"
+        with open(teacher_winner_path, 'r') as f:
+            teacher_winner_data = json.load(f)
 
     print(f"\n{'Metric':<25}{'Teacher':<20}{'Student':<20}{'Winner':<15}")
     print("-"*80)
@@ -1498,6 +1549,10 @@ def run_student_only(
         'student': student_winner_data,
         'winner': 'teacher' if teacher_winner_data['sharpe'] > student_winner['sharpe'] else 'student'
     }
+    if strict_oos_active and cutoff_ts is not None:
+        comparison_data['strict_oos'] = True
+        comparison_data['cutoff'] = str(cutoff_ts)
+        comparison_data['oos_split'] = split_ratio
     comparison_path = pipeline_results_dir / f"teacher_vs_student_{freq.lower()}.json"
     with open(comparison_path, 'w') as f:
         json.dump(comparison_data, f, indent=2)
