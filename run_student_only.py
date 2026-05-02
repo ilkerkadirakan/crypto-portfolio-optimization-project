@@ -483,6 +483,24 @@ def _build_run_signature(
     backtest_end_ts: pd.Timestamp | None = None,
     oos_split: float | None = None,
     strict_oos: bool = False,
+    top_combos: int | None = None,
+    top_k_teachers: int | None = None,
+    same_asset_count: bool | None = None,
+    n_lags: int | None = None,
+    noise_std: float | None = None,
+    noise_samples: int | None = None,
+    xgb_multi_output: bool | None = None,
+    softmax_temp: float | None = None,
+    ml_onfly: bool | None = None,
+    model_choice: str | None = None,
+    xgb_learning_rate: float | None = None,
+    xgb_max_depth: int | None = None,
+    xgb_n_estimators: int | None = None,
+    xgb_subsample: float | None = None,
+    xgb_colsample_bytree: float | None = None,
+    xgb_min_child_weight: float | None = None,
+    xgb_reg_alpha: float | None = None,
+    xgb_reg_lambda: float | None = None,
 ) -> str:
     combo_labels = sorted(_combo_to_str(combo) for combo in combos)
     combo_hash = hashlib.sha256("\n".join(combo_labels).encode("utf-8")).hexdigest()
@@ -500,6 +518,42 @@ def _build_run_signature(
         payload["backtest_end_ts"] = pd.Timestamp(backtest_end_ts).isoformat()
     if oos_split is not None:
         payload["oos_split"] = float(oos_split)
+    if top_combos is not None:
+        payload["top_combos"] = int(top_combos)
+    if top_k_teachers is not None:
+        payload["top_k_teachers"] = int(top_k_teachers)
+    if same_asset_count is not None:
+        payload["same_asset_count"] = bool(same_asset_count)
+    if n_lags is not None:
+        payload["n_lags"] = int(n_lags)
+    if noise_std is not None:
+        payload["noise_std"] = float(noise_std)
+    if noise_samples is not None:
+        payload["noise_samples"] = int(noise_samples)
+    if xgb_multi_output is not None:
+        payload["xgb_multi_output"] = bool(xgb_multi_output)
+    if softmax_temp is not None:
+        payload["softmax_temp"] = float(softmax_temp)
+    if ml_onfly is not None:
+        payload["ml_onfly"] = bool(ml_onfly)
+    if model_choice is not None:
+        payload["model_choice"] = str(model_choice).lower()
+    if xgb_learning_rate is not None:
+        payload["xgb_learning_rate"] = float(xgb_learning_rate)
+    if xgb_max_depth is not None:
+        payload["xgb_max_depth"] = int(xgb_max_depth)
+    if xgb_n_estimators is not None:
+        payload["xgb_n_estimators"] = int(xgb_n_estimators)
+    if xgb_subsample is not None:
+        payload["xgb_subsample"] = float(xgb_subsample)
+    if xgb_colsample_bytree is not None:
+        payload["xgb_colsample_bytree"] = float(xgb_colsample_bytree)
+    if xgb_min_child_weight is not None:
+        payload["xgb_min_child_weight"] = float(xgb_min_child_weight)
+    if xgb_reg_alpha is not None:
+        payload["xgb_reg_alpha"] = float(xgb_reg_alpha)
+    if xgb_reg_lambda is not None:
+        payload["xgb_reg_lambda"] = float(xgb_reg_lambda)
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
@@ -524,6 +578,14 @@ def _build_wf_signature(
     use_ensemble: bool,
     model_types: list[str],
     dynamic_top_combos_wf: bool,
+    xgb_learning_rate: float | None = None,
+    xgb_max_depth: int | None = None,
+    xgb_n_estimators: int | None = None,
+    xgb_subsample: float | None = None,
+    xgb_colsample_bytree: float | None = None,
+    xgb_min_child_weight: float | None = None,
+    xgb_reg_alpha: float | None = None,
+    xgb_reg_lambda: float | None = None,
 ) -> str:
     combo_labels = sorted(_combo_to_str(combo) for combo in combos)
     combo_hash = hashlib.sha256("\n".join(combo_labels).encode("utf-8")).hexdigest()
@@ -548,6 +610,14 @@ def _build_wf_signature(
         "use_ensemble": bool(use_ensemble),
         "model_types": sorted(str(m).lower() for m in model_types),
         "dynamic_top_combos_wf": bool(dynamic_top_combos_wf),
+        "xgb_learning_rate": float(xgb_learning_rate) if xgb_learning_rate is not None else None,
+        "xgb_max_depth": int(xgb_max_depth) if xgb_max_depth is not None else None,
+        "xgb_n_estimators": int(xgb_n_estimators) if xgb_n_estimators is not None else None,
+        "xgb_subsample": float(xgb_subsample) if xgb_subsample is not None else None,
+        "xgb_colsample_bytree": float(xgb_colsample_bytree) if xgb_colsample_bytree is not None else None,
+        "xgb_min_child_weight": float(xgb_min_child_weight) if xgb_min_child_weight is not None else None,
+        "xgb_reg_alpha": float(xgb_reg_alpha) if xgb_reg_alpha is not None else None,
+        "xgb_reg_lambda": float(xgb_reg_lambda) if xgb_reg_lambda is not None else None,
     }
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -656,6 +726,14 @@ def _run_student_walk_forward(
     wf_checkpoint_path: Path | None = None,
     wf_signature: str | None = None,
     enable_checkpoint: bool = True,
+    xgb_learning_rate: float | None = None,
+    xgb_max_depth: int | None = None,
+    xgb_n_estimators: int | None = None,
+    xgb_subsample: float | None = None,
+    xgb_colsample_bytree: float | None = None,
+    xgb_min_child_weight: float | None = None,
+    xgb_reg_alpha: float | None = None,
+    xgb_reg_lambda: float | None = None,
 ) -> None:
     wf_version = "ml_onfly" if ml_onfly else "ml"
     print(f"[WF] Backtest version: {wf_version}")
@@ -747,6 +825,14 @@ def _run_student_walk_forward(
             noise_std=noise_std,
             noise_samples=noise_samples,
             generate_predictions=not ml_onfly,
+            xgb_learning_rate=xgb_learning_rate,
+            xgb_max_depth=xgb_max_depth,
+            xgb_n_estimators=xgb_n_estimators,
+            xgb_subsample=xgb_subsample,
+            xgb_colsample_bytree=xgb_colsample_bytree,
+            xgb_min_child_weight=xgb_min_child_weight,
+            xgb_reg_alpha=xgb_reg_alpha,
+            xgb_reg_lambda=xgb_reg_lambda,
         )
 
         fold_results = backtest_engine.run_backtest_parallel(
@@ -1002,6 +1088,14 @@ def run_student_only(
     noise_samples=0,
     xgb_multi_output=False,
     softmax_temp=1.0,
+    xgb_learning_rate=None,
+    xgb_max_depth=None,
+    xgb_n_estimators=None,
+    xgb_subsample=None,
+    xgb_colsample_bytree=None,
+    xgb_min_child_weight=None,
+    xgb_reg_alpha=None,
+    xgb_reg_lambda=None,
     limit_to_predicted_combos=False,
     ml_onfly=False,
     oos_split=0.0,
@@ -1167,6 +1261,14 @@ def run_student_only(
             use_ensemble=use_ensemble,
             model_types=model_types,
             dynamic_top_combos_wf=dynamic_top_combos_wf,
+            xgb_learning_rate=xgb_learning_rate,
+            xgb_max_depth=xgb_max_depth,
+            xgb_n_estimators=xgb_n_estimators,
+            xgb_subsample=xgb_subsample,
+            xgb_colsample_bytree=xgb_colsample_bytree,
+            xgb_min_child_weight=xgb_min_child_weight,
+            xgb_reg_alpha=xgb_reg_alpha,
+            xgb_reg_lambda=xgb_reg_lambda,
         )
         wf_checkpoint_path = checkpoints_dir / f"checkpoint_student_wf_{freq.lower()}.parquet"
         _run_student_walk_forward(
@@ -1199,6 +1301,14 @@ def run_student_only(
             wf_checkpoint_path=wf_checkpoint_path,
             wf_signature=wf_signature,
             enable_checkpoint=not disable_checkpoint,
+            xgb_learning_rate=xgb_learning_rate,
+            xgb_max_depth=xgb_max_depth,
+            xgb_n_estimators=xgb_n_estimators,
+            xgb_subsample=xgb_subsample,
+            xgb_colsample_bytree=xgb_colsample_bytree,
+            xgb_min_child_weight=xgb_min_child_weight,
+            xgb_reg_alpha=xgb_reg_alpha,
+            xgb_reg_lambda=xgb_reg_lambda,
         )
         return
 
@@ -1221,20 +1331,36 @@ def run_student_only(
         n_lags=n_lags,
         noise_std=noise_std,
         noise_samples=noise_samples,
+        xgb_learning_rate=xgb_learning_rate,
+        xgb_max_depth=xgb_max_depth,
+        xgb_n_estimators=xgb_n_estimators,
+        xgb_subsample=xgb_subsample,
+        xgb_colsample_bytree=xgb_colsample_bytree,
+        xgb_min_child_weight=xgb_min_child_weight,
+        xgb_reg_alpha=xgb_reg_alpha,
+        xgb_reg_lambda=xgb_reg_lambda,
     )
     print(f"[Student] ML {label} weight models trained successfully")
 
     # Archive ML artifacts with a hash so experiments are reproducible
-    timestamp = dt.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    timestamp = dt.datetime.utcnow().strftime("%Y%m%dT%H%M%S_%fZ")
     ml_pred_path = processed_dir / f"ml_predicted_weights_{freq.lower()}.parquet"
     ml_model_path = processed_dir / "ml_models" / f"weight_models_{freq.lower()}.pkl"
     attempt_hash = _hash_file(ml_pred_path) if ml_pred_path.exists() else "missing"
-    attempt_suffix = f"{timestamp}_{attempt_hash[:8]}"
+    attempt_suffix_base = f"{timestamp}_{attempt_hash[:8]}"
+    attempt_suffix = attempt_suffix_base
     attempts_dir = (project_root / "results" / "attempts" / f"student_{freq.lower()}")
     run_bucket = "oos_runs" if strict_oos_active else "student_runs"
     run_mode = "oos" if strict_oos_active else "full"
     run_dir = pipeline_results_dir / run_bucket / f"student_{run_mode}_{freq.lower()}_{attempt_suffix}"
+    collision_idx = 1
+    while run_dir.exists():
+        collision_idx += 1
+        attempt_suffix = f"{attempt_suffix_base}_r{collision_idx}"
+        run_dir = pipeline_results_dir / run_bucket / f"student_{run_mode}_{freq.lower()}_{attempt_suffix}"
     run_dir.mkdir(parents=True, exist_ok=True)
+    if attempt_suffix != attempt_suffix_base:
+        print(f"[Student] Run id collision detected, using unique id={attempt_suffix}")
     print(f"[Student] Run artifact dir: {run_dir}")
     _archive_file(ml_pred_path, attempts_dir, attempt_suffix)
     _archive_file(ml_model_path, attempts_dir, attempt_suffix)
@@ -1275,6 +1401,24 @@ def run_student_only(
         backtest_end_ts=backtest_end_ts,
         oos_split=split_ratio if strict_oos_active else None,
         strict_oos=strict_oos_active,
+        top_combos=top_combos_value,
+        top_k_teachers=top_k_teachers,
+        same_asset_count=same_asset_count,
+        n_lags=n_lags,
+        noise_std=noise_std,
+        noise_samples=noise_samples,
+        xgb_multi_output=xgb_multi_output,
+        softmax_temp=softmax_temp,
+        ml_onfly=ml_onfly,
+        model_choice=model_choice,
+        xgb_learning_rate=xgb_learning_rate,
+        xgb_max_depth=xgb_max_depth,
+        xgb_n_estimators=xgb_n_estimators,
+        xgb_subsample=xgb_subsample,
+        xgb_colsample_bytree=xgb_colsample_bytree,
+        xgb_min_child_weight=xgb_min_child_weight,
+        xgb_reg_alpha=xgb_reg_alpha,
+        xgb_reg_lambda=xgb_reg_lambda,
     )
     results_root = project_root / "results"
 
@@ -1592,8 +1736,21 @@ def run_student_only(
         "cutoff": str(cutoff_ts) if cutoff_ts is not None else None,
         "top_combos": top_combos_value,
         "top_k_teachers": top_k_teachers,
+        "same_asset_count": bool(same_asset_count),
+        "softmax_temp": float(softmax_temp),
+        "n_lags": int(n_lags),
+        "noise_std": float(noise_std),
+        "noise_samples": int(noise_samples),
         "model_choice": model_choice,
         "xgb_multi_output": bool(xgb_multi_output),
+        "xgb_learning_rate": float(xgb_learning_rate) if xgb_learning_rate is not None else None,
+        "xgb_max_depth": int(xgb_max_depth) if xgb_max_depth is not None else None,
+        "xgb_n_estimators": int(xgb_n_estimators) if xgb_n_estimators is not None else None,
+        "xgb_subsample": float(xgb_subsample) if xgb_subsample is not None else None,
+        "xgb_colsample_bytree": float(xgb_colsample_bytree) if xgb_colsample_bytree is not None else None,
+        "xgb_min_child_weight": float(xgb_min_child_weight) if xgb_min_child_weight is not None else None,
+        "xgb_reg_alpha": float(xgb_reg_alpha) if xgb_reg_alpha is not None else None,
+        "xgb_reg_lambda": float(xgb_reg_lambda) if xgb_reg_lambda is not None else None,
         "ml_onfly": bool(ml_onfly),
         "model_list": [str(m).upper() for m in model_list],
         "run_signature": run_signature,
@@ -1695,6 +1852,54 @@ if __name__ == "__main__":
         help="Use a single multi-output XGBoost model instead of per-asset models.",
     )
     parser.add_argument(
+        "--xgb-learning-rate",
+        type=float,
+        default=None,
+        help="Override XGBoost learning rate.",
+    )
+    parser.add_argument(
+        "--xgb-max-depth",
+        type=int,
+        default=None,
+        help="Override XGBoost max_depth.",
+    )
+    parser.add_argument(
+        "--xgb-n-estimators",
+        type=int,
+        default=None,
+        help="Override XGBoost n_estimators.",
+    )
+    parser.add_argument(
+        "--xgb-subsample",
+        type=float,
+        default=None,
+        help="Override XGBoost subsample.",
+    )
+    parser.add_argument(
+        "--xgb-colsample-bytree",
+        type=float,
+        default=None,
+        help="Override XGBoost colsample_bytree.",
+    )
+    parser.add_argument(
+        "--xgb-min-child-weight",
+        type=float,
+        default=None,
+        help="Override XGBoost min_child_weight.",
+    )
+    parser.add_argument(
+        "--xgb-reg-alpha",
+        type=float,
+        default=None,
+        help="Override XGBoost reg_alpha.",
+    )
+    parser.add_argument(
+        "--xgb-reg-lambda",
+        type=float,
+        default=None,
+        help="Override XGBoost reg_lambda.",
+    )
+    parser.add_argument(
         "--softmax-temp",
         type=float,
         default=1.0,
@@ -1790,6 +1995,14 @@ if __name__ == "__main__":
             noise_std=args.noise_std,
             noise_samples=args.noise_samples,
             xgb_multi_output=args.xgb_multi_output,
+            xgb_learning_rate=args.xgb_learning_rate,
+            xgb_max_depth=args.xgb_max_depth,
+            xgb_n_estimators=args.xgb_n_estimators,
+            xgb_subsample=args.xgb_subsample,
+            xgb_colsample_bytree=args.xgb_colsample_bytree,
+            xgb_min_child_weight=args.xgb_min_child_weight,
+            xgb_reg_alpha=args.xgb_reg_alpha,
+            xgb_reg_lambda=args.xgb_reg_lambda,
             softmax_temp=args.softmax_temp,
             limit_to_predicted_combos=args.limit_ml_combos,
             ml_onfly=args.ml_onfly,

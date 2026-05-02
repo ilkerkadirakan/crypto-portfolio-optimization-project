@@ -38,6 +38,61 @@ TOP_K_ASSETS = {2, 3, 5}  # Valid portfolio sizes
 MAX_WEIGHT = 0.30  # Maximum weight per asset
 
 
+def _winsorize_numeric_df(
+    df: pd.DataFrame,
+    lower_q: float = 0.01,
+    upper_q: float = 0.99,
+) -> pd.DataFrame:
+    """Winsorize numeric columns to reduce outlier sensitivity."""
+    if df.empty:
+        return df
+    if not (0.0 <= lower_q < upper_q <= 1.0):
+        return df
+
+    out = df.copy()
+    num_cols = out.select_dtypes(include=[np.number]).columns
+    if len(num_cols) == 0:
+        return out
+
+    quantiles = out[num_cols].quantile([lower_q, upper_q], axis=0)
+    lower = quantiles.loc[lower_q]
+    upper = quantiles.loc[upper_q]
+    out.loc[:, num_cols] = out[num_cols].clip(lower=lower, upper=upper, axis=1)
+    return out
+
+
+def _smooth_teacher_targets_ema(
+    teacher_weights: pd.DataFrame,
+    weight_cols: List[str],
+    span: int = 3,
+) -> pd.DataFrame:
+    """
+    Smooth teacher weight targets with EMA and re-normalize rows.
+
+    Smoothing is applied within each (combo, model) time series.
+    """
+    if teacher_weights.empty or span <= 1:
+        return teacher_weights
+
+    smoothed = teacher_weights.copy()
+    smoothed["timestamp"] = pd.to_datetime(smoothed["timestamp"])
+    smoothed = smoothed.sort_values(["combo", "model", "timestamp"]).reset_index(drop=True)
+
+    ema_values = smoothed.groupby(["combo", "model"], group_keys=False)[weight_cols].apply(
+        lambda grp: grp.ewm(span=span, adjust=False).mean()
+    )
+    smoothed.loc[:, weight_cols] = ema_values.to_numpy(dtype=np.float32, copy=False)
+
+    # Keep weights valid after smoothing.
+    w = smoothed[weight_cols].to_numpy(dtype=np.float32, copy=True)
+    w = np.clip(w, 0.0, None)
+    row_sums = w.sum(axis=1, keepdims=True)
+    nonzero_mask = row_sums[:, 0] > 0
+    w[nonzero_mask] = w[nonzero_mask] / row_sums[nonzero_mask]
+    smoothed.loc[:, weight_cols] = w
+    return smoothed
+
+
 def _ensure_datetime_index(df: pd.DataFrame) -> pd.DataFrame:
     """Ensure DataFrame has DatetimeIndex."""
     if isinstance(df.index, pd.DatetimeIndex):
@@ -234,6 +289,19 @@ def train_weight_models(
     noise_samples: int = 0,
     max_training_rows: int = 2_000_000,
     generate_predictions: bool = True,
+    feature_winsorize: bool = True,
+    feature_winsor_lower_q: float = 0.01,
+    feature_winsor_upper_q: float = 0.99,
+    target_ema_smoothing: bool = True,
+    target_ema_span: int = 3,
+    xgb_learning_rate: float | None = None,
+    xgb_max_depth: int | None = None,
+    xgb_n_estimators: int | None = None,
+    xgb_subsample: float | None = None,
+    xgb_colsample_bytree: float | None = None,
+    xgb_min_child_weight: float | None = None,
+    xgb_reg_alpha: float | None = None,
+    xgb_reg_lambda: float | None = None,
 ) -> None:
     """
     Train ML models to learn portfolio weights from teacher.
@@ -322,12 +390,29 @@ def train_weight_models(
 
     teacher_weights_best = pd.concat(teacher_frames, ignore_index=True)
     print(f"[ML-Weights] Teacher rows selected for training: {len(teacher_weights_best)}")
+    if target_ema_smoothing and int(target_ema_span) > 1:
+        print(f"[ML-Weights] Applying EMA smoothing to teacher targets (span={int(target_ema_span)})...")
+        teacher_weights_best = _smooth_teacher_targets_ema(
+            teacher_weights=teacher_weights_best,
+            weight_cols=weight_cols,
+            span=int(target_ema_span),
+        )
 
     n_lags = max(int(n_lags), 1)
     print(f"[ML-Weights] Creating lagged features with {n_lags} lags...")
 
     # Create lagged features
     features_df = _create_lagged_features(moments_df, returns_df, asset_list, n_lags)
+    if feature_winsorize:
+        print(
+            "[ML-Weights] Winsorizing feature outliers "
+            f"(q={feature_winsor_lower_q:.2f}-{feature_winsor_upper_q:.2f})..."
+        )
+        features_df = _winsorize_numeric_df(
+            features_df,
+            lower_q=float(feature_winsor_lower_q),
+            upper_q=float(feature_winsor_upper_q),
+        )
 
     print(f"[ML-Weights] Features shape: {features_df.shape}")
 
@@ -420,6 +505,45 @@ def train_weight_models(
 
     xgb_n_jobs = max(1, (os.cpu_count() or 1))
 
+    def _xgb_params(
+        *,
+        default_learning_rate: float,
+        default_max_depth: int,
+        default_n_estimators: int,
+        default_subsample: float,
+        default_colsample_bytree: float,
+        default_min_child_weight: float | None,
+        default_reg_alpha: float,
+        default_reg_lambda: float,
+    ) -> dict:
+        params = {
+            "objective": "reg:squarederror",
+            "learning_rate": float(
+                xgb_learning_rate if xgb_learning_rate is not None else default_learning_rate
+            ),
+            "max_depth": int(xgb_max_depth if xgb_max_depth is not None else default_max_depth),
+            "n_estimators": int(
+                xgb_n_estimators if xgb_n_estimators is not None else default_n_estimators
+            ),
+            "subsample": float(xgb_subsample if xgb_subsample is not None else default_subsample),
+            "colsample_bytree": float(
+                xgb_colsample_bytree
+                if xgb_colsample_bytree is not None
+                else default_colsample_bytree
+            ),
+            "reg_alpha": float(xgb_reg_alpha if xgb_reg_alpha is not None else default_reg_alpha),
+            "reg_lambda": float(xgb_reg_lambda if xgb_reg_lambda is not None else default_reg_lambda),
+            "random_state": 42,
+            "verbosity": 0,
+            "n_jobs": xgb_n_jobs,
+        }
+        min_child = (
+            xgb_min_child_weight if xgb_min_child_weight is not None else default_min_child_weight
+        )
+        if min_child is not None:
+            params["min_child_weight"] = float(min_child)
+        return params
+
     if multi_output_xgb:
         print(f"[ML-Weights] Training single multi-output XGBoost model for {len(asset_list)} assets")
     else:
@@ -433,17 +557,16 @@ def train_weight_models(
     models = {}
     if multi_output_xgb:
         model = xgb.XGBRegressor(
-            objective='reg:squarederror',
-            learning_rate=0.05,
-            max_depth=6,
-            n_estimators=400,
-            min_child_weight=5,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            reg_lambda=0.5,
-            random_state=42,
-            verbosity=0,
-            n_jobs=xgb_n_jobs
+            **_xgb_params(
+                default_learning_rate=0.05,
+                default_max_depth=6,
+                default_n_estimators=400,
+                default_subsample=0.8,
+                default_colsample_bytree=0.8,
+                default_min_child_weight=5.0,
+                default_reg_alpha=0.0,
+                default_reg_lambda=0.5,
+            )
         )
         multi_model = MultiOutputRegressor(model, n_jobs=1)
         try:
@@ -478,17 +601,16 @@ def train_weight_models(
                         )
                     elif model_type == 'xgb' and XGB_AVAILABLE:
                         model = xgb.XGBRegressor(
-                            objective='reg:squarederror',
-                            learning_rate=0.03,  # Lower learning rate for better convergence
-                            max_depth=8,         # Deeper trees for more complex patterns
-                            n_estimators=500,    # More trees for better learning
-                            subsample=0.85,
-                            colsample_bytree=0.85,
-                            reg_alpha=0.1,       # L1 regularization
-                            reg_lambda=0.1,      # L2 regularization
-                            random_state=42,
-                            verbosity=0,
-                            n_jobs=xgb_n_jobs
+                            **_xgb_params(
+                                default_learning_rate=0.03,
+                                default_max_depth=8,
+                                default_n_estimators=500,
+                                default_subsample=0.85,
+                                default_colsample_bytree=0.85,
+                                default_min_child_weight=None,
+                                default_reg_alpha=0.1,
+                                default_reg_lambda=0.1,
+                            )
                         )
                     elif model_type == 'cat' and CAT_AVAILABLE:
                         model = CatBoostRegressor(
@@ -540,17 +662,16 @@ def train_weight_models(
                     )
                 elif model_type == 'xgb' and XGB_AVAILABLE:
                     model = xgb.XGBRegressor(
-                        objective='reg:squarederror',
-                        learning_rate=0.05,
-                        max_depth=6,
-                        n_estimators=400,
-                        min_child_weight=5,
-                        subsample=0.8,
-                        colsample_bytree=0.8,
-                        reg_lambda=0.5,
-                        random_state=42,
-                        verbosity=0,
-                        n_jobs=xgb_n_jobs
+                        **_xgb_params(
+                            default_learning_rate=0.05,
+                            default_max_depth=6,
+                            default_n_estimators=400,
+                            default_subsample=0.8,
+                            default_colsample_bytree=0.8,
+                            default_min_child_weight=5.0,
+                            default_reg_alpha=0.0,
+                            default_reg_lambda=0.5,
+                        )
                     )
                 elif model_type == 'cat' and CAT_AVAILABLE:
                     model = CatBoostRegressor(
