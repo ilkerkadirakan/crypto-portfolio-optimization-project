@@ -131,6 +131,7 @@ def _predict_ml_weights_onfly(
     asset_list = models_dict.get("asset_list", [])
     models = models_dict.get("models", {})
     multi_output = bool(models_dict.get("multi_output_xgb"))
+    max_weight = float(models_dict.get("max_weight", ml_weights.MAX_WEIGHT))
 
     if not feature_cols or not asset_list or not models:
         return None
@@ -162,6 +163,7 @@ def _predict_ml_weights_onfly(
         asset_list=list(asset_list),
         combo_assets=list(combo_assets),
         k=len(combo_assets),
+        max_weight=max_weight,
     )
     weights_full = np.zeros(len(target_assets), dtype=float)
     for idx, asset in enumerate(target_assets):

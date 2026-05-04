@@ -4,6 +4,7 @@ No need to recalculate all combinations.
 """
 
 from pathlib import Path
+import os
 import pandas as pd
 import numpy as np
 from src import ml_weights, backtest_engine, combination_utils
@@ -13,6 +14,7 @@ from collections import defaultdict
 import hashlib
 import datetime as dt
 import math
+from lightgbm import LGBMRegressor, LGBMClassifier
 
 # Suppress cvxpy and sklearn warnings
 warnings.filterwarnings('ignore', category=UserWarning, module='cvxpy')
@@ -369,6 +371,177 @@ def _top_combo_labels_from_teacher_slice(
     return labels
 
 
+def _two_stage_select_combo_labels(
+    teacher_train_results: pd.DataFrame,
+    processed_dir: Path,
+    freq: str,
+    candidate_labels: list[str],
+    final_top_n: int,
+    n_lags: int = 15,
+    model_list: list[str] | None = None,
+    stage1_train_frac: float = 0.80,
+    stage1_max_rows: int = 400_000,
+) -> list[str]:
+    """
+    Stage-1 ML combo ranking (v2).
+
+    Train a combo-conditional classifier on train-only data with a cross-sectional
+    target per timestamp (top-performing combos vs others), then rank combos by
+    predicted win probability on a validation tail split.
+    """
+    labels = [str(c) for c in candidate_labels]
+    if final_top_n <= 0 or not labels:
+        return labels
+
+    print(
+        f"[Two-Stage] Stage-1 scoring start: candidates={len(labels)}, "
+        f"target_top={final_top_n}, max_rows={int(stage1_max_rows)}"
+    )
+    use = teacher_train_results.copy()
+    use["combo"] = use["combo"].astype(str)
+    use = use[use["combo"].isin(set(labels))]
+    if use.empty:
+        return labels[:final_top_n]
+
+    if model_list:
+        model_set = {str(m).upper() for m in model_list}
+        use["model"] = use["model"].astype(str).str.upper()
+        filtered = use[use["model"].isin(model_set)]
+        if not filtered.empty:
+            use = filtered
+
+    use["timestamp"] = pd.to_datetime(use["timestamp"], errors="coerce")
+    use = use.dropna(subset=["timestamp", "net_return"])
+    if use.empty:
+        return labels[:final_top_n]
+    print(f"[Two-Stage] Rows after candidate/model filter: {len(use)}")
+
+    weight_cols = [c for c in use.columns if c.startswith("weight_")]
+    if weight_cols:
+        asset_list = [c.replace("weight_", "") for c in weight_cols]
+    else:
+        returns_df_for_assets = ml_weights._load_returns(processed_dir, freq)
+        asset_list = [str(c) for c in returns_df_for_assets.columns]
+
+    if not asset_list:
+        return labels[:final_top_n]
+
+    # Memory/time guard before heavy feature-merge step.
+    # Keep the most recent slice, then optional random cap.
+    premerge_cap = max(int(stage1_max_rows) * 3, 100_000)
+    if len(use) > premerge_cap:
+        use = use.sort_values("timestamp").iloc[-premerge_cap:].copy()
+        print(f"[Two-Stage] Pre-merge cap applied (recent tail): {len(use)} rows")
+
+    moments_df = ml_weights._load_moments(processed_dir, freq)
+    returns_df = ml_weights._load_returns(processed_dir, freq)
+    features_df = ml_weights._create_lagged_features(
+        moments_df=moments_df,
+        returns_df=returns_df,
+        asset_list=asset_list,
+        n_lags=max(int(n_lags), 1),
+    )
+    if features_df.empty:
+        return labels[:final_top_n]
+
+    feature_rows = features_df.reset_index().rename(columns={"index": "timestamp"})
+    merged = use.loc[:, ["timestamp", "combo", "net_return"]].merge(
+        feature_rows,
+        on="timestamp",
+        how="inner",
+    )
+    if merged.empty:
+        return labels[:final_top_n]
+    print(f"[Two-Stage] Rows after feature merge: {len(merged)}")
+
+    combo_tokens = merged["combo"].astype(str).str.split("_")
+    for asset in asset_list:
+        merged[f"combo_has_{asset}"] = combo_tokens.apply(lambda items: 1.0 if asset in items else 0.0)
+
+    max_rows = max(int(stage1_max_rows), 10_000)
+    if len(merged) > max_rows:
+        merged = merged.sample(n=max_rows, random_state=42)
+        print(f"[Two-Stage] Stage-1 sample cap applied: {len(merged)} rows")
+
+    unique_ts = np.sort(merged["timestamp"].dropna().unique())
+    if unique_ts.size < 20:
+        train_df = merged
+        eval_df = merged
+    else:
+        frac = float(stage1_train_frac)
+        frac = min(max(frac, 0.50), 0.95)
+        split_idx = max(1, int(unique_ts.size * frac))
+        split_idx = min(split_idx, unique_ts.size - 1)
+        cutoff = pd.Timestamp(unique_ts[split_idx - 1])
+        train_df = merged[merged["timestamp"] <= cutoff]
+        eval_df = merged[merged["timestamp"] > cutoff]
+        if train_df.empty or eval_df.empty:
+            train_df = merged
+            eval_df = merged
+
+    feature_cols = [c for c in merged.columns if c not in {"timestamp", "combo", "net_return"}]
+
+    # Cross-sectional classification target per timestamp:
+    # 1 if combo is in top quantile of realized returns at that timestamp.
+    top_quantile = 0.20
+    train_rank = train_df.groupby("timestamp")["net_return"].rank(ascending=False, pct=True, method="first")
+    y_train = (train_rank <= top_quantile).astype(np.int8)
+    if y_train.nunique() < 2:
+        train_rank = train_df.groupby("timestamp")["net_return"].rank(ascending=False, method="first")
+        y_train = (train_rank <= 1).astype(np.int8)
+    if y_train.nunique() < 2:
+        return labels[:final_top_n]
+    X_train = train_df[feature_cols].astype(np.float32, copy=False)
+    X_eval = eval_df[feature_cols].astype(np.float32, copy=False)
+    if X_train.empty or X_eval.empty:
+        return labels[:final_top_n]
+
+    pos_ratio = float(y_train.mean())
+    neg_ratio = max(1.0 - pos_ratio, 1e-6)
+    pos_weight = float(neg_ratio / max(pos_ratio, 1e-6))
+
+    if getattr(ml_weights, "XGB_AVAILABLE", False):
+        model = ml_weights.xgb.XGBClassifier(
+            n_estimators=220,
+            max_depth=6,
+            learning_rate=0.05,
+            subsample=0.85,
+            colsample_bytree=0.85,
+            objective="binary:logistic",
+            eval_metric="logloss",
+            scale_pos_weight=pos_weight,
+            n_jobs=max(1, (os.cpu_count() or 4) - 1),
+            random_state=42,
+        )
+    else:
+        model = LGBMClassifier(
+            objective="binary",
+            n_estimators=220,
+            learning_rate=0.05,
+            num_leaves=63,
+            subsample=0.85,
+            colsample_bytree=0.85,
+            class_weight={0: 1.0, 1: pos_weight},
+            random_state=42,
+            n_jobs=max(1, (os.cpu_count() or 4) - 1),
+        )
+
+    model.fit(X_train, y_train)
+    if hasattr(model, "predict_proba"):
+        pred = model.predict_proba(X_eval)[:, 1]
+    else:
+        pred = model.predict(X_eval)
+
+    score_df = eval_df.loc[:, ["combo"]].copy()
+    score_df["pred_win_prob"] = pred
+    combo_scores = score_df.groupby("combo")["pred_win_prob"].mean().sort_values(ascending=False)
+
+    selected = [str(c) for c in combo_scores.index[:max(1, int(final_top_n))]]
+    if not selected:
+        return labels[:final_top_n]
+    return selected
+
+
 def _load_teacher_results_filtered(
     teacher_path: Path,
     combo_filter: set[str] | None = None,
@@ -501,6 +674,20 @@ def _build_run_signature(
     xgb_min_child_weight: float | None = None,
     xgb_reg_alpha: float | None = None,
     xgb_reg_lambda: float | None = None,
+    max_weight: float | None = None,
+    teacher_rank_weighting: bool | None = None,
+    teacher_weight_power: float | None = None,
+    teacher_sharpe_weighting: bool | None = None,
+    teacher_sharpe_power: float | None = None,
+    feature_winsorize: bool | None = None,
+    feature_winsor_lower_q: float | None = None,
+    feature_winsor_upper_q: float | None = None,
+    target_ema_smoothing: bool | None = None,
+    target_ema_span: int | None = None,
+    two_stage: bool | None = None,
+    stage1_candidate_multiplier: int | None = None,
+    stage1_train_frac: float | None = None,
+    stage1_max_rows: int | None = None,
 ) -> str:
     combo_labels = sorted(_combo_to_str(combo) for combo in combos)
     combo_hash = hashlib.sha256("\n".join(combo_labels).encode("utf-8")).hexdigest()
@@ -554,6 +741,34 @@ def _build_run_signature(
         payload["xgb_reg_alpha"] = float(xgb_reg_alpha)
     if xgb_reg_lambda is not None:
         payload["xgb_reg_lambda"] = float(xgb_reg_lambda)
+    if max_weight is not None:
+        payload["max_weight"] = float(max_weight)
+    if teacher_rank_weighting is not None:
+        payload["teacher_rank_weighting"] = bool(teacher_rank_weighting)
+    if teacher_weight_power is not None:
+        payload["teacher_weight_power"] = float(teacher_weight_power)
+    if teacher_sharpe_weighting is not None:
+        payload["teacher_sharpe_weighting"] = bool(teacher_sharpe_weighting)
+    if teacher_sharpe_power is not None:
+        payload["teacher_sharpe_power"] = float(teacher_sharpe_power)
+    if feature_winsorize is not None:
+        payload["feature_winsorize"] = bool(feature_winsorize)
+    if feature_winsor_lower_q is not None:
+        payload["feature_winsor_lower_q"] = float(feature_winsor_lower_q)
+    if feature_winsor_upper_q is not None:
+        payload["feature_winsor_upper_q"] = float(feature_winsor_upper_q)
+    if target_ema_smoothing is not None:
+        payload["target_ema_smoothing"] = bool(target_ema_smoothing)
+    if target_ema_span is not None:
+        payload["target_ema_span"] = int(target_ema_span)
+    if two_stage is not None:
+        payload["two_stage"] = bool(two_stage)
+    if stage1_candidate_multiplier is not None:
+        payload["stage1_candidate_multiplier"] = int(stage1_candidate_multiplier)
+    if stage1_train_frac is not None:
+        payload["stage1_train_frac"] = float(stage1_train_frac)
+    if stage1_max_rows is not None:
+        payload["stage1_max_rows"] = int(stage1_max_rows)
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
@@ -586,6 +801,20 @@ def _build_wf_signature(
     xgb_min_child_weight: float | None = None,
     xgb_reg_alpha: float | None = None,
     xgb_reg_lambda: float | None = None,
+    max_weight: float | None = None,
+    teacher_rank_weighting: bool | None = None,
+    teacher_weight_power: float | None = None,
+    teacher_sharpe_weighting: bool | None = None,
+    teacher_sharpe_power: float | None = None,
+    feature_winsorize: bool = False,
+    feature_winsor_lower_q: float = 0.01,
+    feature_winsor_upper_q: float = 0.99,
+    target_ema_smoothing: bool = False,
+    target_ema_span: int = 3,
+    two_stage: bool = False,
+    stage1_candidate_multiplier: int = 5,
+    stage1_train_frac: float = 0.80,
+    stage1_max_rows: int = 400_000,
 ) -> str:
     combo_labels = sorted(_combo_to_str(combo) for combo in combos)
     combo_hash = hashlib.sha256("\n".join(combo_labels).encode("utf-8")).hexdigest()
@@ -618,6 +847,20 @@ def _build_wf_signature(
         "xgb_min_child_weight": float(xgb_min_child_weight) if xgb_min_child_weight is not None else None,
         "xgb_reg_alpha": float(xgb_reg_alpha) if xgb_reg_alpha is not None else None,
         "xgb_reg_lambda": float(xgb_reg_lambda) if xgb_reg_lambda is not None else None,
+        "max_weight": float(max_weight) if max_weight is not None else None,
+        "teacher_rank_weighting": bool(teacher_rank_weighting) if teacher_rank_weighting is not None else None,
+        "teacher_weight_power": float(teacher_weight_power) if teacher_weight_power is not None else None,
+        "teacher_sharpe_weighting": bool(teacher_sharpe_weighting) if teacher_sharpe_weighting is not None else None,
+        "teacher_sharpe_power": float(teacher_sharpe_power) if teacher_sharpe_power is not None else None,
+        "feature_winsorize": bool(feature_winsorize),
+        "feature_winsor_lower_q": float(feature_winsor_lower_q),
+        "feature_winsor_upper_q": float(feature_winsor_upper_q),
+        "target_ema_smoothing": bool(target_ema_smoothing),
+        "target_ema_span": int(target_ema_span),
+        "two_stage": bool(two_stage),
+        "stage1_candidate_multiplier": int(stage1_candidate_multiplier),
+        "stage1_train_frac": float(stage1_train_frac),
+        "stage1_max_rows": int(stage1_max_rows),
     }
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -734,6 +977,20 @@ def _run_student_walk_forward(
     xgb_min_child_weight: float | None = None,
     xgb_reg_alpha: float | None = None,
     xgb_reg_lambda: float | None = None,
+    max_weight: float = 0.30,
+    teacher_rank_weighting: bool = False,
+    teacher_weight_power: float = 1.0,
+    teacher_sharpe_weighting: bool = False,
+    teacher_sharpe_power: float = 1.0,
+    feature_winsorize: bool = False,
+    feature_winsor_lower_q: float = 0.01,
+    feature_winsor_upper_q: float = 0.99,
+    target_ema_smoothing: bool = False,
+    target_ema_span: int = 3,
+    two_stage: bool = False,
+    stage1_candidate_multiplier: int = 5,
+    stage1_train_frac: float = 0.80,
+    stage1_max_rows: int = 400_000,
 ) -> None:
     wf_version = "ml_onfly" if ml_onfly else "ml"
     print(f"[WF] Backtest version: {wf_version}")
@@ -833,6 +1090,16 @@ def _run_student_walk_forward(
             xgb_min_child_weight=xgb_min_child_weight,
             xgb_reg_alpha=xgb_reg_alpha,
             xgb_reg_lambda=xgb_reg_lambda,
+            max_weight=max_weight,
+            teacher_rank_weighting=teacher_rank_weighting,
+            teacher_weight_power=teacher_weight_power,
+            teacher_sharpe_weighting=teacher_sharpe_weighting,
+            teacher_sharpe_power=teacher_sharpe_power,
+            feature_winsorize=feature_winsorize,
+            feature_winsor_lower_q=feature_winsor_lower_q,
+            feature_winsor_upper_q=feature_winsor_upper_q,
+            target_ema_smoothing=target_ema_smoothing,
+            target_ema_span=target_ema_span,
         )
 
         fold_results = backtest_engine.run_backtest_parallel(
@@ -1096,6 +1363,20 @@ def run_student_only(
     xgb_min_child_weight=None,
     xgb_reg_alpha=None,
     xgb_reg_lambda=None,
+    max_weight=0.30,
+    teacher_rank_weighting=False,
+    teacher_weight_power=1.0,
+    teacher_sharpe_weighting=False,
+    teacher_sharpe_power=1.0,
+    feature_winsorize=False,
+    feature_winsor_lower_q=0.01,
+    feature_winsor_upper_q=0.99,
+    target_ema_smoothing=False,
+    target_ema_span=3,
+    two_stage=False,
+    stage1_candidate_multiplier=5,
+    stage1_train_frac=0.80,
+    stage1_max_rows=400_000,
     limit_to_predicted_combos=False,
     ml_onfly=False,
     oos_split=0.0,
@@ -1199,7 +1480,10 @@ def run_student_only(
     if combo_limit is not None:
         combos = combos[:max(combo_limit, 0)]
 
-    if top_combos_value > 0 and not dynamic_top_combos_wf:
+    if two_stage and dynamic_top_combos_wf:
+        print("[Student-Only] two-stage combo scoring is disabled in walk-forward mode; using existing WF top-combo flow.")
+
+    if top_combos_value > 0 and not dynamic_top_combos_wf and not two_stage:
         top_labels = _top_combo_labels_from_ranking(
             pipeline_results_dir=pipeline_results_dir,
             freq=freq,
@@ -1215,8 +1499,52 @@ def run_student_only(
             f"[Student-Only] Applied top combo filter: top {top_combos_value} "
             f"({source_label}) -> {len(combos)}/{combos_before} combinations"
         )
+    elif two_stage and not dynamic_top_combos_wf:
+        combo_labels_all = [_combo_to_str(c) for c in combos]
+        candidate_count = len(combo_labels_all)
+        if top_combos_value > 0:
+            multiplier = max(int(stage1_candidate_multiplier), 1)
+            candidate_count = min(len(combo_labels_all), int(top_combos_value * multiplier))
+        candidate_labels = _top_combo_labels_from_ranking(
+            pipeline_results_dir=pipeline_results_dir,
+            freq=freq,
+            top_combos=candidate_count,
+            teacher_results=teacher_train_results if strict_oos_active else teacher_results,
+            use_ranking_csv=not strict_oos_active,
+        )
+        candidate_set = set(candidate_labels)
+        combos_before = len(combos)
+        candidate_combos = [c for c in combos if _combo_to_str(c) in candidate_set]
+        if not candidate_combos:
+            candidate_combos = combos.copy()
+            candidate_labels = [_combo_to_str(c) for c in candidate_combos]
+        final_top_n = top_combos_value if top_combos_value > 0 else len(candidate_combos)
+        print(
+            f"[Student-Only] Stage-1 candidate pool: {len(candidate_combos)}/{combos_before} "
+            f"(multiplier={max(int(stage1_candidate_multiplier), 1)})"
+        )
+        stage1_selected_labels = _two_stage_select_combo_labels(
+            teacher_train_results=teacher_train_results if strict_oos_active else teacher_results,
+            processed_dir=processed_dir,
+            freq=freq,
+            candidate_labels=[_combo_to_str(c) for c in candidate_combos],
+            final_top_n=final_top_n,
+            n_lags=n_lags,
+            model_list=[m.upper() for m in (model_list or ["MVSK"])],
+            stage1_train_frac=stage1_train_frac,
+            stage1_max_rows=stage1_max_rows,
+        )
+        selected_set = set(stage1_selected_labels)
+        combos = [c for c in candidate_combos if _combo_to_str(c) in selected_set]
+        print(
+            f"[Student-Only] Two-stage selection kept {len(combos)}/{len(candidate_combos)} "
+            f"combos for stage-2 weight learning/backtest"
+        )
 
     print(f"[Student-Only] Found {len(combos)} portfolio combinations")
+    if not combos:
+        print("[Error] No combinations left after filtering/selection.")
+        return
 
     from src import ml_weights
     if model_choice == "ensemble":
@@ -1269,6 +1597,20 @@ def run_student_only(
             xgb_min_child_weight=xgb_min_child_weight,
             xgb_reg_alpha=xgb_reg_alpha,
             xgb_reg_lambda=xgb_reg_lambda,
+            max_weight=max_weight,
+            teacher_rank_weighting=teacher_rank_weighting,
+            teacher_weight_power=teacher_weight_power,
+            teacher_sharpe_weighting=teacher_sharpe_weighting,
+            teacher_sharpe_power=teacher_sharpe_power,
+            feature_winsorize=feature_winsorize,
+            feature_winsor_lower_q=feature_winsor_lower_q,
+            feature_winsor_upper_q=feature_winsor_upper_q,
+            target_ema_smoothing=target_ema_smoothing,
+            target_ema_span=target_ema_span,
+            two_stage=two_stage,
+            stage1_candidate_multiplier=stage1_candidate_multiplier,
+            stage1_train_frac=stage1_train_frac,
+            stage1_max_rows=stage1_max_rows,
         )
         wf_checkpoint_path = checkpoints_dir / f"checkpoint_student_wf_{freq.lower()}.parquet"
         _run_student_walk_forward(
@@ -1309,6 +1651,16 @@ def run_student_only(
             xgb_min_child_weight=xgb_min_child_weight,
             xgb_reg_alpha=xgb_reg_alpha,
             xgb_reg_lambda=xgb_reg_lambda,
+            max_weight=max_weight,
+            teacher_rank_weighting=teacher_rank_weighting,
+            teacher_weight_power=teacher_weight_power,
+            teacher_sharpe_weighting=teacher_sharpe_weighting,
+            teacher_sharpe_power=teacher_sharpe_power,
+            feature_winsorize=feature_winsorize,
+            feature_winsor_lower_q=feature_winsor_lower_q,
+            feature_winsor_upper_q=feature_winsor_upper_q,
+            target_ema_smoothing=target_ema_smoothing,
+            target_ema_span=target_ema_span,
         )
         return
 
@@ -1339,6 +1691,16 @@ def run_student_only(
         xgb_min_child_weight=xgb_min_child_weight,
         xgb_reg_alpha=xgb_reg_alpha,
         xgb_reg_lambda=xgb_reg_lambda,
+        max_weight=max_weight,
+        teacher_rank_weighting=teacher_rank_weighting,
+        teacher_weight_power=teacher_weight_power,
+        teacher_sharpe_weighting=teacher_sharpe_weighting,
+        teacher_sharpe_power=teacher_sharpe_power,
+        feature_winsorize=feature_winsorize,
+        feature_winsor_lower_q=feature_winsor_lower_q,
+        feature_winsor_upper_q=feature_winsor_upper_q,
+        target_ema_smoothing=target_ema_smoothing,
+        target_ema_span=target_ema_span,
     )
     print(f"[Student] ML {label} weight models trained successfully")
 
@@ -1419,6 +1781,16 @@ def run_student_only(
         xgb_min_child_weight=xgb_min_child_weight,
         xgb_reg_alpha=xgb_reg_alpha,
         xgb_reg_lambda=xgb_reg_lambda,
+        max_weight=max_weight,
+        teacher_rank_weighting=teacher_rank_weighting,
+        teacher_weight_power=teacher_weight_power,
+        teacher_sharpe_weighting=teacher_sharpe_weighting,
+        teacher_sharpe_power=teacher_sharpe_power,
+        feature_winsorize=feature_winsorize,
+        feature_winsor_lower_q=feature_winsor_lower_q,
+        feature_winsor_upper_q=feature_winsor_upper_q,
+        target_ema_smoothing=target_ema_smoothing,
+        target_ema_span=target_ema_span,
     )
     results_root = project_root / "results"
 
@@ -1751,6 +2123,20 @@ def run_student_only(
         "xgb_min_child_weight": float(xgb_min_child_weight) if xgb_min_child_weight is not None else None,
         "xgb_reg_alpha": float(xgb_reg_alpha) if xgb_reg_alpha is not None else None,
         "xgb_reg_lambda": float(xgb_reg_lambda) if xgb_reg_lambda is not None else None,
+        "max_weight": float(max_weight),
+        "teacher_rank_weighting": bool(teacher_rank_weighting),
+        "teacher_weight_power": float(teacher_weight_power),
+        "teacher_sharpe_weighting": bool(teacher_sharpe_weighting),
+        "teacher_sharpe_power": float(teacher_sharpe_power),
+        "feature_winsorize": bool(feature_winsorize),
+        "feature_winsor_lower_q": float(feature_winsor_lower_q),
+        "feature_winsor_upper_q": float(feature_winsor_upper_q),
+        "target_ema_smoothing": bool(target_ema_smoothing),
+        "target_ema_span": int(target_ema_span),
+        "two_stage": bool(two_stage),
+        "stage1_candidate_multiplier": int(stage1_candidate_multiplier),
+        "stage1_train_frac": float(stage1_train_frac),
+        "stage1_max_rows": int(stage1_max_rows),
         "ml_onfly": bool(ml_onfly),
         "model_list": [str(m).upper() for m in model_list],
         "run_signature": run_signature,
@@ -1900,6 +2286,85 @@ if __name__ == "__main__":
         help="Override XGBoost reg_lambda.",
     )
     parser.add_argument(
+        "--max-weight",
+        type=float,
+        default=0.30,
+        help="Maximum per-asset weight cap applied in ML portfolio constraints.",
+    )
+    parser.add_argument(
+        "--teacher-rank-weighting",
+        action="store_true",
+        help="Use rank-weighted sample weights based on teacher Sharpe rank.",
+    )
+    parser.add_argument(
+        "--teacher-weight-power",
+        type=float,
+        default=1.0,
+        help="Strength of teacher rank weighting (higher = more emphasis on top-ranked teachers).",
+    )
+    parser.add_argument(
+        "--teacher-sharpe-weighting",
+        action="store_true",
+        help="Use teacher Sharpe-magnitude weighted sample weights for stage-2 training.",
+    )
+    parser.add_argument(
+        "--teacher-sharpe-power",
+        type=float,
+        default=1.0,
+        help="Strength of teacher Sharpe weighting (higher = more emphasis on higher-Sharpe teachers).",
+    )
+    parser.add_argument(
+        "--two-stage",
+        action="store_true",
+        help="Enable two-stage student flow: stage-1 ML combo scoring, then stage-2 weight learning.",
+    )
+    parser.add_argument(
+        "--stage1-candidate-multiplier",
+        type=int,
+        default=5,
+        help="Stage-1 candidate pool multiplier over top-combos (e.g., 5 => top_combos*5 candidates).",
+    )
+    parser.add_argument(
+        "--stage1-train-frac",
+        type=float,
+        default=0.80,
+        help="Train fraction for stage-1 time split (rest used for validation scoring).",
+    )
+    parser.add_argument(
+        "--stage1-max-rows",
+        type=int,
+        default=400000,
+        help="Maximum training rows used by stage-1 scorer for memory safety.",
+    )
+    parser.add_argument(
+        "--feature-winsorize",
+        action="store_true",
+        help="Enable winsorization for feature outliers before student training.",
+    )
+    parser.add_argument(
+        "--feature-winsor-lower-q",
+        type=float,
+        default=0.01,
+        help="Lower quantile for feature winsorization (used with --feature-winsorize).",
+    )
+    parser.add_argument(
+        "--feature-winsor-upper-q",
+        type=float,
+        default=0.99,
+        help="Upper quantile for feature winsorization (used with --feature-winsorize).",
+    )
+    parser.add_argument(
+        "--target-ema-smoothing",
+        action="store_true",
+        help="Enable EMA smoothing on teacher target weights before student training.",
+    )
+    parser.add_argument(
+        "--target-ema-span",
+        type=int,
+        default=3,
+        help="EMA span for teacher target smoothing (used with --target-ema-smoothing).",
+    )
+    parser.add_argument(
         "--softmax-temp",
         type=float,
         default=1.0,
@@ -2003,6 +2468,20 @@ if __name__ == "__main__":
             xgb_min_child_weight=args.xgb_min_child_weight,
             xgb_reg_alpha=args.xgb_reg_alpha,
             xgb_reg_lambda=args.xgb_reg_lambda,
+            max_weight=args.max_weight,
+            teacher_rank_weighting=args.teacher_rank_weighting,
+            teacher_weight_power=args.teacher_weight_power,
+            teacher_sharpe_weighting=args.teacher_sharpe_weighting,
+            teacher_sharpe_power=args.teacher_sharpe_power,
+            two_stage=args.two_stage,
+            stage1_candidate_multiplier=args.stage1_candidate_multiplier,
+            stage1_train_frac=args.stage1_train_frac,
+            stage1_max_rows=args.stage1_max_rows,
+            feature_winsorize=args.feature_winsorize,
+            feature_winsor_lower_q=args.feature_winsor_lower_q,
+            feature_winsor_upper_q=args.feature_winsor_upper_q,
+            target_ema_smoothing=args.target_ema_smoothing,
+            target_ema_span=args.target_ema_span,
             softmax_temp=args.softmax_temp,
             limit_to_predicted_combos=args.limit_ml_combos,
             ml_onfly=args.ml_onfly,

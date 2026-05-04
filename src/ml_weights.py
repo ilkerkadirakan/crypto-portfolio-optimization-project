@@ -241,7 +241,8 @@ def _apply_portfolio_constraints(
     raw_scores: np.ndarray,
     asset_list: List[str],
     combo_assets: List[str],
-    k: int = 5
+    k: int = 5,
+    max_weight: float = MAX_WEIGHT,
 ) -> np.ndarray:
     """
     Apply portfolio constraints to convert raw scores to valid weights.
@@ -264,7 +265,9 @@ def _apply_portfolio_constraints(
             masked_weights[idx] = weights[idx]
 
     # Apply weight cap
-    masked_weights = np.clip(masked_weights, 0, MAX_WEIGHT)
+    cap = float(max_weight) if max_weight is not None else MAX_WEIGHT
+    cap = min(max(cap, 0.01), 1.0)
+    masked_weights = np.clip(masked_weights, 0, cap)
 
     # Renormalize
     weight_sum = np.sum(masked_weights)
@@ -289,11 +292,16 @@ def train_weight_models(
     noise_samples: int = 0,
     max_training_rows: int = 2_000_000,
     generate_predictions: bool = True,
-    feature_winsorize: bool = True,
+    feature_winsorize: bool = False,
     feature_winsor_lower_q: float = 0.01,
     feature_winsor_upper_q: float = 0.99,
-    target_ema_smoothing: bool = True,
+    target_ema_smoothing: bool = False,
     target_ema_span: int = 3,
+    max_weight: float = MAX_WEIGHT,
+    teacher_rank_weighting: bool = False,
+    teacher_weight_power: float = 1.0,
+    teacher_sharpe_weighting: bool = False,
+    teacher_sharpe_power: float = 1.0,
     xgb_learning_rate: float | None = None,
     xgb_max_depth: int | None = None,
     xgb_n_estimators: int | None = None,
@@ -374,6 +382,35 @@ def train_weight_models(
         )
         top_pairs = top_pairs[:max_pairs_safe]
 
+    pair_to_rank: Dict[Tuple[str, str], int] = {}
+    pair_to_weight: Dict[Tuple[str, str], float] = {}
+    pair_to_sharpe: Dict[Tuple[str, str], float] = {}
+    if top_pairs:
+        weight_power = max(float(teacher_weight_power), 0.0)
+        sharpe_power = max(float(teacher_sharpe_power), 0.0)
+        denom = max(len(top_pairs) - 1, 1)
+        sharpes = np.array(
+            [float(teacher_perf.loc[p, "sharpe"]) if p in teacher_perf.index else 0.0 for p in top_pairs],
+            dtype=np.float32,
+        )
+        s_min = float(np.nanmin(sharpes)) if sharpes.size else 0.0
+        s_max = float(np.nanmax(sharpes)) if sharpes.size else 0.0
+        s_span = max(s_max - s_min, 1e-8)
+        for rank_idx, pair in enumerate(top_pairs):
+            pair_to_rank[pair] = rank_idx + 1
+            pair_to_sharpe[pair] = float(teacher_perf.loc[pair, "sharpe"]) if pair in teacher_perf.index else 0.0
+            rank_w = 1.0
+            if teacher_rank_weighting:
+                # rank 1 gets the highest weight, last rank gets the lowest.
+                normalized = 1.0 - (rank_idx / denom)
+                rank_w = (0.5 + normalized) ** (1.0 + weight_power)
+            sharpe_w = 1.0
+            if teacher_sharpe_weighting:
+                s = pair_to_sharpe[pair]
+                s_norm = (s - s_min) / s_span
+                sharpe_w = (0.5 + s_norm) ** (1.0 + sharpe_power)
+            pair_to_weight[pair] = float(rank_w * sharpe_w)
+
     # Filter teacher rows to selected portfolios before selecting weight columns.
     # This avoids copying tens of millions of rows when top_k_teachers is small.
     teacher_cols = ['timestamp', 'combo', 'model'] + weight_cols
@@ -390,6 +427,18 @@ def train_weight_models(
 
     teacher_weights_best = pd.concat(teacher_frames, ignore_index=True)
     print(f"[ML-Weights] Teacher rows selected for training: {len(teacher_weights_best)}")
+    if teacher_rank_weighting or teacher_sharpe_weighting:
+        teacher_weights_best["teacher_sample_weight"] = teacher_weights_best.apply(
+            lambda r: pair_to_weight.get((str(r["combo"]), str(r["model"])), 1.0), axis=1
+        )
+        mode_bits = []
+        if teacher_rank_weighting:
+            mode_bits.append("rank")
+        if teacher_sharpe_weighting:
+            mode_bits.append("sharpe")
+        print(f"[ML-Weights] Using teacher {'+'.join(mode_bits)}-weighted sample weights for training.")
+    else:
+        teacher_weights_best["teacher_sample_weight"] = 1.0
     if target_ema_smoothing and int(target_ema_span) > 1:
         print(f"[ML-Weights] Applying EMA smoothing to teacher targets (span={int(target_ema_span)})...")
         teacher_weights_best = _smooth_teacher_targets_ema(
@@ -442,8 +491,15 @@ def train_weight_models(
             merged_df[f"combo_has_{asset}"] = combo_tokens.apply(lambda items: 1.0 if asset in items else 0.0)
 
     # Split features and targets
-    X = merged_df.drop(columns=weight_cols + ['combo', 'model', 'timestamp'], errors='ignore').fillna(0)
+    X = merged_df.drop(
+        columns=weight_cols + ['combo', 'model', 'timestamp', 'teacher_sample_weight'],
+        errors='ignore'
+    ).fillna(0)
     y = merged_df[weight_cols].fillna(0)
+    sample_weight = merged_df.get("teacher_sample_weight")
+    if sample_weight is None:
+        sample_weight = pd.Series(np.ones(len(merged_df), dtype=np.float32), index=merged_df.index)
+    sample_weight = sample_weight.astype(np.float32, copy=False)
     X = X.astype(np.float32, copy=False)
     y = y.astype(np.float32, copy=False)
 
@@ -454,6 +510,7 @@ def train_weight_models(
         x_base = X.to_numpy(dtype=np.float32, copy=True)
         augmented_y = [y_base]
         augmented_x = [x_base]
+        augmented_sw = [sample_weight.to_numpy(dtype=np.float32, copy=True)]
 
         for _ in range(noise_samples):
             noise = np.random.normal(0.0, noise_std, size=y_base.shape).astype(np.float32)
@@ -464,9 +521,11 @@ def train_weight_models(
             noisy = noisy / row_sums
             augmented_y.append(noisy)
             augmented_x.append(x_base)
+            augmented_sw.append(augmented_sw[0])
 
         X = pd.DataFrame(np.vstack(augmented_x), columns=X.columns)
         y = pd.DataFrame(np.vstack(augmented_y), columns=y.columns)
+        sample_weight = pd.Series(np.concatenate(augmented_sw), dtype=np.float32)
         X = X.astype(np.float32, copy=False)
         y = y.astype(np.float32, copy=False)
 
@@ -570,7 +629,7 @@ def train_weight_models(
         )
         multi_model = MultiOutputRegressor(model, n_jobs=1)
         try:
-            multi_model.fit(X_values, y_values)
+            multi_model.fit(X_values, y_values, sample_weight=sample_weight.to_numpy(dtype=np.float32, copy=False))
             models["__multi_output_xgb__"] = multi_model
             print("[ML-Weights]   ✓ Trained multi-output XGBoost model")
         except Exception as exc:
@@ -635,7 +694,11 @@ def train_weight_models(
                         )
 
                     try:
-                        model.fit(X_values, y[asset_col].to_numpy(dtype=np.float32, copy=False))
+                        model.fit(
+                            X_values,
+                            y[asset_col].to_numpy(dtype=np.float32, copy=False),
+                            sample_weight=sample_weight.to_numpy(dtype=np.float32, copy=False),
+                        )
                         asset_models[model_type] = model
                     except Exception as exc:
                         warnings.warn(f"[ML-Weights] Failed to train {model_type} for {asset_name}: {exc}")
@@ -694,7 +757,11 @@ def train_weight_models(
                     )
 
                 try:
-                    model.fit(X_values, y[asset_col].to_numpy(dtype=np.float32, copy=False))
+                    model.fit(
+                        X_values,
+                        y[asset_col].to_numpy(dtype=np.float32, copy=False),
+                        sample_weight=sample_weight.to_numpy(dtype=np.float32, copy=False),
+                    )
                     models[asset_name] = model
                     print(f"[ML-Weights]   ✓ Trained {model_type} model for {asset_name}")
                 except Exception as exc:
@@ -717,7 +784,12 @@ def train_weight_models(
             'asset_list': asset_list,
             'feature_cols': list(X.columns),
             'freq': freq,
-            'multi_output_xgb': multi_output_xgb
+            'multi_output_xgb': multi_output_xgb,
+            'max_weight': float(min(max(float(max_weight), 0.01), 1.0)),
+            'teacher_rank_weighting': bool(teacher_rank_weighting),
+            'teacher_weight_power': float(teacher_weight_power),
+            'teacher_sharpe_weighting': bool(teacher_sharpe_weighting),
+            'teacher_sharpe_power': float(teacher_sharpe_power),
         }, models_path)
         print(f"[ML-Weights] Saved models to {models_path}")
     except PermissionError as exc:
@@ -729,7 +801,12 @@ def train_weight_models(
             'asset_list': asset_list,
             'feature_cols': list(X.columns),
             'freq': freq,
-            'multi_output_xgb': multi_output_xgb
+            'multi_output_xgb': multi_output_xgb,
+            'max_weight': float(min(max(float(max_weight), 0.01), 1.0)),
+            'teacher_rank_weighting': bool(teacher_rank_weighting),
+            'teacher_weight_power': float(teacher_weight_power),
+            'teacher_sharpe_weighting': bool(teacher_sharpe_weighting),
+            'teacher_sharpe_power': float(teacher_sharpe_power),
         }, alt_models_path)
         warnings.warn(
             f"[ML-Weights] Failed to write {models_path} ({exc}); saved to {alt_models_path} instead."
