@@ -132,6 +132,8 @@ def _predict_ml_weights_onfly(
     models = models_dict.get("models", {})
     multi_output = bool(models_dict.get("multi_output_xgb"))
     max_weight = float(models_dict.get("max_weight", ml_weights.MAX_WEIGHT))
+    regime_split = bool(models_dict.get("regime_split", False))
+    regime_threshold = models_dict.get("regime_threshold", None)
 
     if not feature_cols or not asset_list or not models:
         return None
@@ -146,6 +148,14 @@ def _predict_ml_weights_onfly(
     raw_scores = np.zeros(len(asset_list), dtype=float)
     if multi_output and "__multi_output_xgb__" in models:
         preds = models["__multi_output_xgb__"].predict(X_row.values)
+        raw_scores = np.asarray(preds[0], dtype=float)
+    elif multi_output and regime_split and (
+        "__multi_output_xgb__::low" in models and "__multi_output_xgb__::high" in models
+    ):
+        sig = float(row.get("regime_vol_signal", 0.0))
+        thr = float(regime_threshold) if regime_threshold is not None else 0.0
+        key = "__multi_output_xgb__::high" if sig >= thr else "__multi_output_xgb__::low"
+        preds = models[key].predict(X_row.values)
         raw_scores = np.asarray(preds[0], dtype=float)
     else:
         for idx, asset in enumerate(asset_list):

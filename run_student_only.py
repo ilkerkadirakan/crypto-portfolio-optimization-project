@@ -688,6 +688,8 @@ def _build_run_signature(
     stage1_candidate_multiplier: int | None = None,
     stage1_train_frac: float | None = None,
     stage1_max_rows: int | None = None,
+    regime_split: bool | None = None,
+    regime_quantile: float | None = None,
 ) -> str:
     combo_labels = sorted(_combo_to_str(combo) for combo in combos)
     combo_hash = hashlib.sha256("\n".join(combo_labels).encode("utf-8")).hexdigest()
@@ -769,6 +771,10 @@ def _build_run_signature(
         payload["stage1_train_frac"] = float(stage1_train_frac)
     if stage1_max_rows is not None:
         payload["stage1_max_rows"] = int(stage1_max_rows)
+    if regime_split is not None:
+        payload["regime_split"] = bool(regime_split)
+    if regime_quantile is not None:
+        payload["regime_quantile"] = float(regime_quantile)
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
@@ -815,6 +821,8 @@ def _build_wf_signature(
     stage1_candidate_multiplier: int = 5,
     stage1_train_frac: float = 0.80,
     stage1_max_rows: int = 400_000,
+    regime_split: bool = False,
+    regime_quantile: float = 0.70,
 ) -> str:
     combo_labels = sorted(_combo_to_str(combo) for combo in combos)
     combo_hash = hashlib.sha256("\n".join(combo_labels).encode("utf-8")).hexdigest()
@@ -861,6 +869,8 @@ def _build_wf_signature(
         "stage1_candidate_multiplier": int(stage1_candidate_multiplier),
         "stage1_train_frac": float(stage1_train_frac),
         "stage1_max_rows": int(stage1_max_rows),
+        "regime_split": bool(regime_split),
+        "regime_quantile": float(regime_quantile),
     }
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -982,6 +992,8 @@ def _run_student_walk_forward(
     teacher_weight_power: float = 1.0,
     teacher_sharpe_weighting: bool = False,
     teacher_sharpe_power: float = 1.0,
+    regime_split: bool = False,
+    regime_quantile: float = 0.70,
     feature_winsorize: bool = False,
     feature_winsor_lower_q: float = 0.01,
     feature_winsor_upper_q: float = 0.99,
@@ -1095,6 +1107,8 @@ def _run_student_walk_forward(
             teacher_weight_power=teacher_weight_power,
             teacher_sharpe_weighting=teacher_sharpe_weighting,
             teacher_sharpe_power=teacher_sharpe_power,
+            regime_split=regime_split,
+            regime_quantile=regime_quantile,
             feature_winsorize=feature_winsorize,
             feature_winsor_lower_q=feature_winsor_lower_q,
             feature_winsor_upper_q=feature_winsor_upper_q,
@@ -1368,6 +1382,8 @@ def run_student_only(
     teacher_weight_power=1.0,
     teacher_sharpe_weighting=False,
     teacher_sharpe_power=1.0,
+    regime_split=False,
+    regime_quantile=0.70,
     feature_winsorize=False,
     feature_winsor_lower_q=0.01,
     feature_winsor_upper_q=0.99,
@@ -1602,6 +1618,8 @@ def run_student_only(
             teacher_weight_power=teacher_weight_power,
             teacher_sharpe_weighting=teacher_sharpe_weighting,
             teacher_sharpe_power=teacher_sharpe_power,
+            regime_split=regime_split,
+            regime_quantile=regime_quantile,
             feature_winsorize=feature_winsorize,
             feature_winsor_lower_q=feature_winsor_lower_q,
             feature_winsor_upper_q=feature_winsor_upper_q,
@@ -1656,6 +1674,8 @@ def run_student_only(
             teacher_weight_power=teacher_weight_power,
             teacher_sharpe_weighting=teacher_sharpe_weighting,
             teacher_sharpe_power=teacher_sharpe_power,
+            regime_split=regime_split,
+            regime_quantile=regime_quantile,
             feature_winsorize=feature_winsorize,
             feature_winsor_lower_q=feature_winsor_lower_q,
             feature_winsor_upper_q=feature_winsor_upper_q,
@@ -1696,6 +1716,8 @@ def run_student_only(
         teacher_weight_power=teacher_weight_power,
         teacher_sharpe_weighting=teacher_sharpe_weighting,
         teacher_sharpe_power=teacher_sharpe_power,
+        regime_split=regime_split,
+        regime_quantile=regime_quantile,
         feature_winsorize=feature_winsorize,
         feature_winsor_lower_q=feature_winsor_lower_q,
         feature_winsor_upper_q=feature_winsor_upper_q,
@@ -1786,6 +1808,8 @@ def run_student_only(
         teacher_weight_power=teacher_weight_power,
         teacher_sharpe_weighting=teacher_sharpe_weighting,
         teacher_sharpe_power=teacher_sharpe_power,
+        regime_split=regime_split,
+        regime_quantile=regime_quantile,
         feature_winsorize=feature_winsorize,
         feature_winsor_lower_q=feature_winsor_lower_q,
         feature_winsor_upper_q=feature_winsor_upper_q,
@@ -2128,6 +2152,8 @@ def run_student_only(
         "teacher_weight_power": float(teacher_weight_power),
         "teacher_sharpe_weighting": bool(teacher_sharpe_weighting),
         "teacher_sharpe_power": float(teacher_sharpe_power),
+        "regime_split": bool(regime_split),
+        "regime_quantile": float(regime_quantile),
         "feature_winsorize": bool(feature_winsorize),
         "feature_winsor_lower_q": float(feature_winsor_lower_q),
         "feature_winsor_upper_q": float(feature_winsor_upper_q),
@@ -2314,6 +2340,17 @@ if __name__ == "__main__":
         help="Strength of teacher Sharpe weighting (higher = more emphasis on higher-Sharpe teachers).",
     )
     parser.add_argument(
+        "--regime-split",
+        action="store_true",
+        help="Train separate student models for low/high volatility regimes.",
+    )
+    parser.add_argument(
+        "--regime-quantile",
+        type=float,
+        default=0.70,
+        help="Quantile threshold for high-vol regime split (0.5-0.95 recommended).",
+    )
+    parser.add_argument(
         "--two-stage",
         action="store_true",
         help="Enable two-stage student flow: stage-1 ML combo scoring, then stage-2 weight learning.",
@@ -2473,6 +2510,8 @@ if __name__ == "__main__":
             teacher_weight_power=args.teacher_weight_power,
             teacher_sharpe_weighting=args.teacher_sharpe_weighting,
             teacher_sharpe_power=args.teacher_sharpe_power,
+            regime_split=args.regime_split,
+            regime_quantile=args.regime_quantile,
             two_stage=args.two_stage,
             stage1_candidate_multiplier=args.stage1_candidate_multiplier,
             stage1_train_frac=args.stage1_train_frac,

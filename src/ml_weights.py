@@ -169,6 +169,10 @@ def _create_lagged_features(
         raise ValueError("Moments DataFrame should have MultiIndex columns")
 
     timestamps = moments_df.index
+    asset_cols = [a for a in asset_list if a in returns_df.columns]
+    market_ret = returns_df[asset_cols].mean(axis=1) if asset_cols else pd.Series(0.0, index=returns_df.index)
+    regime_vol = market_ret.rolling(20, min_periods=5).std()
+    regime_vol_aligned = regime_vol.reindex(timestamps).to_numpy(dtype=np.float32, copy=False)
 
     for ts in timestamps:
         ts_idx = timestamps.get_loc(ts)
@@ -177,6 +181,9 @@ def _create_lagged_features(
             continue  # Skip if not enough history
 
         row_features = {'timestamp': ts}
+        lag_idx_sig = ts_idx - 1
+        if lag_idx_sig >= 0:
+            row_features["regime_vol_signal"] = float(regime_vol_aligned[lag_idx_sig])
 
         for asset in asset_list:
             # Core lagged features
@@ -302,6 +309,8 @@ def train_weight_models(
     teacher_weight_power: float = 1.0,
     teacher_sharpe_weighting: bool = False,
     teacher_sharpe_power: float = 1.0,
+    regime_split: bool = False,
+    regime_quantile: float = 0.70,
     xgb_learning_rate: float | None = None,
     xgb_max_depth: int | None = None,
     xgb_n_estimators: int | None = None,
@@ -490,9 +499,25 @@ def train_weight_models(
         for asset in asset_list:
             merged_df[f"combo_has_{asset}"] = combo_tokens.apply(lambda items: 1.0 if asset in items else 0.0)
 
+    regime_threshold = None
+    if regime_split:
+        if "regime_vol_signal" in merged_df.columns:
+            signal = pd.to_numeric(merged_df["regime_vol_signal"], errors="coerce")
+        else:
+            vol_cols = [c for c in merged_df.columns if c.endswith("_vol_5")]
+            signal = merged_df[vol_cols].mean(axis=1) if vol_cols else pd.Series(np.nan, index=merged_df.index)
+        signal = signal.fillna(signal.median())
+        q = float(min(max(regime_quantile, 0.50), 0.95))
+        regime_threshold = float(signal.quantile(q))
+        merged_df["regime_label"] = np.where(signal >= regime_threshold, "high", "low")
+        print(
+            f"[ML-Weights] Regime split enabled: quantile={q:.2f}, "
+            f"threshold={regime_threshold:.6f}, high_share={(merged_df['regime_label']=='high').mean():.2%}"
+        )
+
     # Split features and targets
     X = merged_df.drop(
-        columns=weight_cols + ['combo', 'model', 'timestamp', 'teacher_sample_weight'],
+        columns=weight_cols + ['combo', 'model', 'timestamp', 'teacher_sample_weight', 'regime_label'],
         errors='ignore'
     ).fillna(0)
     y = merged_df[weight_cols].fillna(0)
@@ -629,9 +654,29 @@ def train_weight_models(
         )
         multi_model = MultiOutputRegressor(model, n_jobs=1)
         try:
-            multi_model.fit(X_values, y_values, sample_weight=sample_weight.to_numpy(dtype=np.float32, copy=False))
-            models["__multi_output_xgb__"] = multi_model
-            print("[ML-Weights]   ✓ Trained multi-output XGBoost model")
+            sw_all = sample_weight.to_numpy(dtype=np.float32, copy=False)
+            if regime_split and "regime_label" in merged_df.columns:
+                reg = merged_df["regime_label"].astype(str).to_numpy()
+                for regime_name in ("low", "high"):
+                    mask = reg == regime_name
+                    if mask.sum() < 1000:
+                        warnings.warn(
+                            f"[ML-Weights] Regime '{regime_name}' has too few rows ({int(mask.sum())}); "
+                            "falling back to single-model training."
+                        )
+                        regime_split = False
+                        break
+                if regime_split:
+                    for regime_name in ("low", "high"):
+                        mask = reg == regime_name
+                        regime_model = MultiOutputRegressor(model.__class__(**model.get_params()), n_jobs=1)
+                        regime_model.fit(X_values[mask], y_values[mask], sample_weight=sw_all[mask])
+                        models[f"__multi_output_xgb__::{regime_name}"] = regime_model
+                        print(f"[ML-Weights]   ✓ Trained multi-output XGBoost model ({regime_name} regime)")
+            if not regime_split:
+                multi_model.fit(X_values, y_values, sample_weight=sw_all)
+                models["__multi_output_xgb__"] = multi_model
+                print("[ML-Weights]   ✓ Trained multi-output XGBoost model")
         except Exception as exc:
             warnings.warn(f"[ML-Weights] Failed to train multi-output XGBoost model: {exc}")
             return
@@ -790,6 +835,8 @@ def train_weight_models(
             'teacher_weight_power': float(teacher_weight_power),
             'teacher_sharpe_weighting': bool(teacher_sharpe_weighting),
             'teacher_sharpe_power': float(teacher_sharpe_power),
+            'regime_split': bool(regime_split),
+            'regime_threshold': float(regime_threshold) if regime_threshold is not None else None,
         }, models_path)
         print(f"[ML-Weights] Saved models to {models_path}")
     except PermissionError as exc:
@@ -807,6 +854,8 @@ def train_weight_models(
             'teacher_weight_power': float(teacher_weight_power),
             'teacher_sharpe_weighting': bool(teacher_sharpe_weighting),
             'teacher_sharpe_power': float(teacher_sharpe_power),
+            'regime_split': bool(regime_split),
+            'regime_threshold': float(regime_threshold) if regime_threshold is not None else None,
         }, alt_models_path)
         warnings.warn(
             f"[ML-Weights] Failed to write {models_path} ({exc}); saved to {alt_models_path} instead."
@@ -832,6 +881,30 @@ def train_weight_models(
                 predictions[f'pred_weight_{asset_name}'] = preds[:, idx]
         except Exception as exc:
             warnings.warn(f"[ML-Weights] Failed to predict with multi-output XGBoost: {exc}")
+            return
+    elif multi_output_xgb and any(k.startswith("__multi_output_xgb__::") for k in models.keys()):
+        try:
+            signal = (
+                X["regime_vol_signal"].to_numpy(dtype=np.float32, copy=False)
+                if "regime_vol_signal" in X.columns
+                else np.zeros(len(X), dtype=np.float32)
+            )
+            thr = float(regime_threshold) if regime_threshold is not None else float(np.nanmedian(signal))
+            reg_mask_high = signal >= thr
+            preds = np.zeros((len(X), len(asset_list)), dtype=np.float32)
+            model_low = models.get("__multi_output_xgb__::low")
+            model_high = models.get("__multi_output_xgb__::high")
+            if model_low is None or model_high is None:
+                warnings.warn("[ML-Weights] Regime models missing (low/high); aborting prediction export.")
+                return
+            if (~reg_mask_high).any():
+                preds[~reg_mask_high] = model_low.predict(X_values[~reg_mask_high])
+            if reg_mask_high.any():
+                preds[reg_mask_high] = model_high.predict(X_values[reg_mask_high])
+            for idx, asset_name in enumerate(asset_list):
+                predictions[f'pred_weight_{asset_name}'] = preds[:, idx]
+        except Exception as exc:
+            warnings.warn(f"[ML-Weights] Failed regime-aware prediction with multi-output XGBoost: {exc}")
             return
     else:
         for asset_name, model_data in models.items():
