@@ -73,6 +73,7 @@ results/
 runs/
 outputs/
 checkpoints/
+report_bundle_*/
 
 # Log files
 *.log
@@ -88,6 +89,8 @@ nul
 *.backup
 *.old
 *~
+docs/_tmp_*
+run_student_*.ps1
 
 # System files
 .DS_Store
@@ -141,3 +144,5 @@ catboost_info/
 
 # PyCharm
 .idea/
+
+docs/
